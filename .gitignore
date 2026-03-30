@@ -1,0 +1,14 @@
+# Node / package manager
+node_modules/
+package-lock.json
+npm-debug.log*
+yarn.lock
+pnpm-lock.yaml
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Local pi project harness and runtime state
+.pi/
