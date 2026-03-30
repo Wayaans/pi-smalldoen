@@ -42,13 +42,7 @@ Use `pi-smalldoen` when you want pi to behave more like a disciplined personal d
 
 ## Install
 
-### Install from a local checkout
-
-```bash
-pi install -l /absolute/path/to/pi-smalldoen
-```
-
-### Install from GitHub
+Install the package into the current project:
 
 ```bash
 pi install -l git:github.com/wayanary/pi-smalldoen
@@ -65,7 +59,7 @@ Then reload pi:
 ## Quick start
 
 1. Install the package
-2. Create `.pi/smalldoen.json` from `defaults/smalldoen.example.json`
+2. Create `.pi/smalldoen.json`
 3. Configure per-role models
 4. Start pi
 5. Enable orchestration mode:
@@ -81,10 +75,6 @@ Then ask for a full feature workflow.
 Create this file in the target project:
 
 - `.pi/smalldoen.json`
-
-Start from:
-
-- `defaults/smalldoen.example.json`
 
 Example:
 
@@ -172,24 +162,6 @@ By default, the package writes artifacts under:
 - `.pi/smalldoen/reports/review/`
 
 These can be overridden in `.pi/smalldoen.json`.
-
-## Development model
-
-This repository keeps the reusable package code here:
-
-- `extensions/smalldoen/`
-- `prompts/`
-- `defaults/`
-
-For local dogfooding, the repo also keeps a thin project wrapper at:
-
-- `.pi/extensions/smalldoen/index.ts`
-
-That wrapper re-exports the package entry point from:
-
-- `extensions/smalldoen/index.ts`
-
-So the package code is the source of truth while the repository still works as a local pi project.
 
 ## Limitations
 
