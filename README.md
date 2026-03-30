@@ -45,7 +45,7 @@ Use `pi-smalldoen` when you want pi to behave more like a disciplined personal d
 Install the package into the current project:
 
 ```bash
-pi install -l git:github.com/wayanary/pi-smalldoen
+pi install -l git@github.com:Wayaans/pi-smalldoen.git
 ```
 
 Use `-l` so pi writes the package into project-local `.pi/settings.json`.
