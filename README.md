@@ -34,9 +34,10 @@ Use `pi-smalldoen` when you want pi to behave more like a disciplined personal d
 - per-role provider/model selection
 - project-local config via `.pi/smalldoen.json`
 - versioned plan files
-- package-based execution scheduling
-- parallel-safe worker grouping
-- reviewer with repair loops
+- visible orchestrator-led delegation flow
+- isolated child agents per role
+- package-based plan inspection and scheduling
+- live run widget and status tracking
 - project-local memory, reports, and run manifests
 - docs validation tool for orchestrator and scout
 
@@ -126,10 +127,9 @@ This means the package works immediately after install, while projects can overr
 
 When `/orch` mode is enabled, the top-level session can use:
 
-- `run_feature` — full end-to-end flow
-- `plan_feature` — scout + planner stage
-- `execute_plan` — execute packages from a validated plan
-- `delegate` — manual child-role execution
+- `manage_run` — create and update the live orchestration run state
+- `inspect_plan` — parse a plan and inspect safe package groups
+- `delegate` — isolated child-role execution
 - `docs_lookup` — framework and library documentation validation
 
 ## Commands
@@ -144,12 +144,13 @@ When `/orch` mode is enabled, the top-level session can use:
 
 Typical full workflow:
 
-1. **orchestrator**
-2. optional **scout**
-3. **planner**
-4. **engineer/designer** work packages
-5. **reviewer**
-6. repair loop if needed
+1. **orchestrator** starts and updates the run
+2. optional **scout** runs in an isolated child session
+3. **planner** writes a versioned plan
+4. **orchestrator** inspects the plan and chooses execution order
+5. **engineer/designer** run isolated work packages sequentially or in parallel only when safe
+6. **orchestrator** marks package progress and then starts **reviewer**
+7. **orchestrator** decides reroute, rescout, or replan if needed
 
 ## Project-local artifacts
 

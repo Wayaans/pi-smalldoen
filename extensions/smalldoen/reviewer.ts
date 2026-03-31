@@ -1,5 +1,10 @@
 import type { ParsedPlan } from "./plan";
-import type { ExecutedPackageDetails } from "./types";
+
+interface ReviewExecutionResult {
+	packageId: string;
+	owner: "engineer" | "designer";
+	changedFiles: string[];
+}
 
 export interface ReviewVerdict {
 	verdict: "pass" | "pass_with_warnings" | "fail";
@@ -38,11 +43,11 @@ export function parseChangedFiles(output: string): string[] {
 	return Array.from(new Set(paths.filter(Boolean)));
 }
 
-export function collectChangedFiles(results: ExecutedPackageDetails[]): string[] {
+export function collectChangedFiles(results: ReviewExecutionResult[]): string[] {
 	return Array.from(new Set(results.flatMap((result) => result.changedFiles)));
 }
 
-export function collectAffectedFiles(plan: ParsedPlan, results: ExecutedPackageDetails[]): string[] {
+export function collectAffectedFiles(plan: ParsedPlan, results: ReviewExecutionResult[]): string[] {
 	const packageIds = new Set(results.map((result) => result.packageId));
 	const relatedPackages = plan.packages.filter((pkg) => packageIds.has(pkg.packageId));
 	const files = relatedPackages.flatMap((pkg) => [...pkg.filesToChange, ...pkg.affectedFiles]);
@@ -52,7 +57,7 @@ export function collectAffectedFiles(plan: ParsedPlan, results: ExecutedPackageD
 export function buildReviewTask(input: {
 	runId: string;
 	plan: ParsedPlan;
-	results: ExecutedPackageDetails[];
+	results: ReviewExecutionResult[];
 }): string {
 	const changedFiles = collectChangedFiles(input.results);
 	const affectedFiles = collectAffectedFiles(input.plan, input.results);

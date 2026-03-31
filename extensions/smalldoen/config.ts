@@ -51,6 +51,10 @@ export function getConfigPath(cwd: string): string {
 	return path.join(findProjectRoot(cwd), ".pi", "smalldoen.json");
 }
 
+export function hasSmalldoenConfig(cwd: string): boolean {
+	return fs.existsSync(getConfigPath(cwd));
+}
+
 export function loadSmalldoenConfig(cwd: string): SmalldoenConfig {
 	return readJsonIfExists(getConfigPath(cwd)) ?? {};
 }

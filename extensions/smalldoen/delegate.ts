@@ -20,6 +20,9 @@ export interface RunDelegatedRoleParams {
 	role: WorkerRole;
 	task: string;
 	feature?: string;
+	runId?: string;
+	label?: string;
+	packageId?: string;
 	signal?: AbortSignal;
 	onUpdate?: (details: DelegateToolDetails) => void;
 }
@@ -35,7 +38,7 @@ function createRunId(): string {
 }
 
 export async function runDelegatedRole(params: RunDelegatedRoleParams): Promise<RunDelegatedRoleResult> {
-	const { cwd, role, task, feature, signal, onUpdate } = params;
+	const { cwd, role, task, feature, runId, label, packageId, signal, onUpdate } = params;
 	const agent = getAgentConfig(cwd, role);
 	if (!agent) throw new Error(`Missing agent definition for role: ${role}`);
 
@@ -45,6 +48,7 @@ export async function runDelegatedRole(params: RunDelegatedRoleParams): Promise<
 	const sourceRunId = createRunId();
 
 	const roleMemoryContext = await buildRoleMemoryContext(role, cwd);
+	const configuredModel = agent.provider && agent.model ? `${agent.provider}/${agent.model}` : agent.model;
 
 	if (role === "planner") {
 		if (!feature?.trim()) throw new Error("Planner delegation requires the feature field.");
@@ -75,10 +79,15 @@ export async function runDelegatedRole(params: RunDelegatedRoleParams): Promise<
 		onUpdate: (text) => {
 			onUpdate?.({
 				role,
+				status: "running",
+				runId,
+				label,
+				packageId,
 				featureSlug,
 				planPath,
 				exitCode: 0,
 				finalOutput: text || "",
+				model: configuredModel,
 			});
 		},
 	});
@@ -94,12 +103,16 @@ export async function runDelegatedRole(params: RunDelegatedRoleParams): Promise<
 
 	const details: DelegateToolDetails = {
 		role,
+		status: childResult.stopReason === "aborted" ? "aborted" : childResult.exitCode === 0 ? "success" : "error",
+		runId,
+		label,
+		packageId,
 		featureSlug,
 		planPath,
 		exitCode: childResult.exitCode,
 		stderr: childResult.stderr || undefined,
 		finalOutput: childResult.finalOutput,
-		model: childResult.model,
+		model: childResult.model || configuredModel,
 		stopReason: childResult.stopReason,
 		errorMessage: childResult.errorMessage,
 	};
@@ -113,7 +126,7 @@ export async function runDelegatedRole(params: RunDelegatedRoleParams): Promise<
 			sourceRunId,
 			featureSlug,
 			planPath,
-			model: childResult.model,
+			model: childResult.model || configuredModel,
 			stopReason: childResult.stopReason,
 		},
 	});

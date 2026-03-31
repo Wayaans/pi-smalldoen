@@ -4,7 +4,12 @@
   "description": "Project-local orchestration workflow for pi with orchestrator, scout, planner, workers, and reviewer",
   "type": "module",
   "license": "MIT",
-  "keywords": ["pi-package", "pi", "orchestration", "multi-agent"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "orchestration",
+    "multi-agent"
+  ],
   "files": [
     "extensions",
     "prompts",
@@ -13,8 +18,8 @@
   ],
   "scripts": {
     "clean": "echo 'nothing to clean'",
-    "build": "echo 'nothing to build'",
-    "check": "echo 'run pi smoke tests manually'"
+    "build": "tsc",
+    "check": "tsc"
   },
   "pi": {
     "extensions": [
@@ -29,5 +34,8 @@
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*",
     "@sinclair/typebox": "*"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.2"
   }
 }

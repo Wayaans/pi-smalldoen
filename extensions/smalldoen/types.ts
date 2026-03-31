@@ -16,9 +16,21 @@ export interface OrchestrationModeEntry {
 	updatedAt: string;
 }
 
+export interface ReviewSummary {
+	verdict: "pass" | "pass_with_warnings" | "fail";
+	routingHint: "none" | "engineer" | "designer" | "both";
+	needRescout: boolean;
+	summary: string;
+}
+
 export interface DelegateToolDetails {
 	role: Exclude<AgentRole, "orchestrator">;
+	status: "running" | "success" | "error" | "aborted";
+	runId?: string;
+	label?: string;
+	packageId?: string;
 	planPath?: string;
+	reportPath?: string;
 	featureSlug?: string;
 	exitCode: number;
 	stderr?: string;
@@ -26,61 +38,42 @@ export interface DelegateToolDetails {
 	model?: string;
 	stopReason?: string;
 	errorMessage?: string;
+	changedFiles?: string[];
+	review?: ReviewSummary;
 }
 
-export interface PlanFeatureDetails {
-	scoutUsed: boolean;
-	featureSlug: string;
-	planPath: string;
-	packageCount: number;
-	parallelAllowed: boolean;
-	scoutSummary?: string;
-	plannerSummary: string;
-}
-
-export interface ExecutedPackageDetails {
+export interface PlanInspectionPackage {
 	packageId: string;
 	owner: "engineer" | "designer";
 	goal: string;
 	filesToChange: string[];
 	affectedFiles: string[];
-	changedFiles: string[];
-	exitCode: number;
-	finalOutput: string;
-	stderr?: string;
-	model?: string;
+	dependsOn: string[];
+	parallelSafe: boolean;
+	acceptanceChecks: string[];
 }
 
-export interface ExecutePlanDetails {
+export interface PlanInspectionDetails {
 	featureSlug: string;
 	planPath: string;
-	groupCount: number;
+	parallelAllowed: boolean;
 	packageCount: number;
 	groups: Array<{ index: number; packageIds: string[] }>;
-	results: ExecutedPackageDetails[];
+	packages: PlanInspectionPackage[];
 }
 
-export interface ReviewExecutionDetails {
+export interface ManageRunDetails {
+	action: "start" | "status" | "stage" | "package" | "review" | "finish";
 	runId: string;
+	feature: string;
 	featureSlug: string;
-	planPath: string;
-	reportPath: string;
-	verdict: "pass" | "pass_with_warnings" | "fail";
-	routingHint: "none" | "engineer" | "designer" | "both";
-	needRescout: boolean;
-	summary: string;
-	filesReviewed: string[];
-	criticalIssueCount: number;
-	warningCount: number;
-}
-
-export interface RunFeatureDetails {
-	runId: string;
-	featureSlug: string;
-	planPath: string;
-	reviewLoops: number;
-	finalVerdict: "pass" | "pass_with_warnings" | "fail";
-	reportPath: string;
-	scoutUsed: boolean;
+	status: "active" | "stale" | "failed" | "completed";
+	stage: string;
+	updatedAt: string;
+	planPath?: string;
+	review?: ReviewSummary;
 	packageCount: number;
+	activeSubagentCount: number;
+	completedPackageCount: number;
+	failedPackageCount: number;
 }

@@ -1,5 +1,4 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { getModeIndicatorText } from "./config";
 import { SMALLDOEN_MODE_ENTRY, SMALLDOEN_STATUS_KEY, type OrchestrationModeEntry, type OrchestrationModeState } from "./types";
 
 export function getOrchestrationMode(state: OrchestrationModeState): boolean {
@@ -44,17 +43,7 @@ export function toggleOrchestrationMode(
 	return setOrchestrationMode(pi, ctx, state, !state.enabled);
 }
 
-export function applyModeIndicator(ctx: ExtensionContext, enabled: boolean): void {
+export function applyModeIndicator(ctx: ExtensionContext, _enabled: boolean): void {
 	if (!ctx.hasUI) return;
-	if (!enabled) {
-		ctx.ui.setStatus(SMALLDOEN_STATUS_KEY, undefined);
-		return;
-	}
-
-	const theme = ctx.ui.theme;
-	const label = getModeIndicatorText(ctx.cwd);
-	ctx.ui.setStatus(
-		SMALLDOEN_STATUS_KEY,
-		theme.fg("accent", "●") + theme.fg("dim", ` ${label}`),
-	);
+	ctx.ui.setStatus(SMALLDOEN_STATUS_KEY, undefined);
 }

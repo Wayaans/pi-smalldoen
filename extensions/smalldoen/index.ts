@@ -2,10 +2,10 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { getMarkdownTheme, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
+import { Container, Markdown, Spacer, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { getAgentConfig } from "./agents";
-import { getConfiguredModelSpec } from "./config";
+import { getConfiguredModelSpec, getConfigPath, hasSmalldoenConfig } from "./config";
 import { buildDocsContext, fetchUrl, searchDocs } from "./docs";
 import { runDelegatedRole, workerRoles, type WorkerRole } from "./delegate";
 import {
@@ -15,7 +15,7 @@ import {
 	isReadOnlyBashCommand,
 	isTopLevelOrchestrationModeEnabled,
 } from "./guards";
-import { buildRoleMemoryContext, recordRoleExecution } from "./memory";
+import { buildRoleMemoryContext } from "./memory";
 import {
 	applyModeIndicator,
 	getOrchestrationMode,
@@ -28,112 +28,141 @@ import {
 	loadParsedPlan,
 	slugifyFeatureName,
 	type ParsedPlan,
-	type PlanPackage,
 } from "./plan";
 import {
 	ensureRuntimeLayout,
 	getReviewReportPath,
 	getScoutReportPath,
 } from "./paths";
-import {
-	buildReviewTask,
-	collectChangedFiles,
-	parseChangedFiles,
-	parseReviewOutput,
-	type ReviewVerdict,
-} from "./reviewer";
+import { parseChangedFiles, parseReviewOutput } from "./reviewer";
 import {
 	appendRunEvent,
 	createRunManifest,
 	loadLatestRunManifest,
+	loadRunManifest,
 	markRunFinished,
 	markRunStale,
+	replacePackageStates,
 	updateRunManifest,
+	upsertPackageState,
+	upsertSubagentState,
 	type RunManifest,
+	type RunPackageState,
 } from "./run-state";
 import { schedulePackages } from "./scheduler";
 import {
 	DELEGATE_TOOL_NAME,
 	type AgentRole,
 	type DelegateToolDetails,
-	type ExecutePlanDetails,
-	type ExecutedPackageDetails,
+	type ManageRunDetails,
 	type OrchestrationModeState,
-	type PlanFeatureDetails,
-	type ReviewExecutionDetails,
-	type RunFeatureDetails,
+	type PlanInspectionDetails,
+	type ReviewSummary,
 } from "./types";
 
-const PLAN_FEATURE_TOOL_NAME = "plan_feature" as const;
-const EXECUTE_PLAN_TOOL_NAME = "execute_plan" as const;
 const DOCS_LOOKUP_TOOL_NAME = "docs_lookup" as const;
-const RUN_FEATURE_TOOL_NAME = "run_feature" as const;
+const INSPECT_PLAN_TOOL_NAME = "inspect_plan" as const;
+const MANAGE_RUN_TOOL_NAME = "manage_run" as const;
+const SMALLDOEN_RUN_WIDGET_KEY = "smalldoen-run-widget" as const;
 const modeState: OrchestrationModeState = { enabled: false };
 const runtimeRole = getRuntimeRole();
-const MAX_REVIEW_LOOPS = 3;
 
-let activeRun: RunManifest | undefined;
-let activeRunAbortController: AbortController | undefined;
+let activeRunId: string | undefined;
+
+interface LiveSubagentState {
+	key: string;
+	slot: number;
+	role: WorkerRole;
+	label: string;
+	packageId?: string;
+	runId?: string;
+	status: DelegateToolDetails["status"];
+	model?: string;
+	output: string;
+	updatedAt: string;
+}
+
+const liveSubagents = new Map<string, LiveSubagentState>();
+const liveSubagentOrder: string[] = [];
+const liveSubagentOverlays = new Map<number, { handle: { hide(): void }; panel: SubagentOverlayPanel; stateKey: string }>();
 
 const ORCHESTRATOR_RUNTIME_PROMPT = `
 Orchestration mode is enabled for this session.
 
-You are acting as the project orchestrator.
+You are the orchestrator: the visible top-level agent, project manager, and decision-maker for the full workflow.
 
 Hard rules:
 - Do not use write or edit.
-- Do not implement code directly.
-- Require a planner-generated plan before any worker implementation.
-- Skip scout only for tiny, local, or already-clear tasks.
-- Use scout for broader analysis and documentation validation when needed.
-- Use planner to create a detailed versioned plan.
-- Prefer the run_feature tool for full end-to-end execution.
-- Prefer the plan_feature tool to run the scout -> planner phase.
-- Prefer the execute_plan tool to execute parsed work packages from a validated plan.
-- Use delegate only for targeted manual child-role work.
-- Use reviewer after worker execution.
-- Use docs_lookup to validate framework or library guidance when needed.
+- Do not implement product code directly.
+- Keep orchestration decisions in your own turns. Do not hide the workflow inside macro tools.
+- Use manage_run to create and update the live run artifact.
+- Use delegate to run scout, planner, engineer, designer, and reviewer in isolated child sessions.
+- Use inspect_plan after planner completes so you can inspect package metadata and safe parallel groups yourself.
+- Before each major delegation, briefly tell the user what you decided and why.
+- After each delegated role finishes, read its result yourself and decide the next step.
+- Planner is mandatory before any implementation work.
+- Only launch multiple engineer or designer delegates in the same turn when you intentionally chose a parallel-safe group from inspect_plan.
+- After each package finishes, update the run package state with manage_run.
+- Run reviewer only after the relevant packages are complete.
+- If reviewer fails, you decide whether to reroute work, rescout, or replan.
 `;
 
 const DelegateParams = Type.Object({
-	role: StringEnum(workerRoles, { description: "Specialized child role to run" }),
-	task: Type.String({ description: "Task for the delegated role" }),
+	role: StringEnum(workerRoles, { description: "Specialized child role to run in an isolated pi subprocess." }),
+	task: Type.String({ description: "Task for the delegated role." }),
 	feature: Type.Optional(
-		Type.String({ description: "Feature name or feature slug. Required for planner so the runtime can version the plan." }),
+		Type.String({ description: "Feature name or feature slug. Required for planner so the runtime can version the plan path." }),
 	),
+	runId: Type.Optional(Type.String({ description: "Optional orchestration run id from manage_run start. Enables live run status tracking." })),
+	label: Type.Optional(Type.String({ description: "Optional short UI label such as Scout pass, Planner, PKG-001, or Review." })),
+	packageId: Type.Optional(Type.String({ description: "Optional package id for engineer or designer work such as PKG-001." })),
 });
 
-const PlanFeatureParams = Type.Object({
-	feature: Type.String({ description: "Feature name or feature slug used for versioned plan generation." }),
-	objective: Type.String({ description: "Implementation objective that the planner must turn into a versioned plan." }),
-	scoutMode: Type.Optional(
-		StringEnum(["auto", "run", "skip"] as const, {
-			description: "Whether to run scout before planner. Use run for complex work, skip for tiny local work, auto for runtime heuristic.",
+const InspectPlanParams = Type.Object({
+	feature: Type.Optional(Type.String({ description: "Feature name or feature slug. Used to resolve the latest plan if planPath is omitted." })),
+	planPath: Type.Optional(Type.String({ description: "Explicit path to a plan file. If omitted, the latest plan for feature is used." })),
+	packageIds: Type.Optional(Type.Array(Type.String({ description: "Optional subset of package ids to inspect and schedule." }))),
+});
+
+const ManageRunParams = Type.Object({
+	action: StringEnum(["start", "status", "stage", "package", "review", "finish"] as const, {
+		description: "Run state operation to perform.",
+	}),
+	runId: Type.Optional(Type.String({ description: "Run id. Required for all actions except start and latest-status lookups." })),
+	feature: Type.Optional(Type.String({ description: "Feature name or slug. Required for start." })),
+	objective: Type.Optional(Type.String({ description: "Feature objective. Required for start." })),
+	stage: Type.Optional(Type.String({ description: "Current orchestration stage, for example intake, scout, planning, execution, review, repair." })),
+	note: Type.Optional(Type.String({ description: "Optional event or status note to store alongside the update." })),
+	planPath: Type.Optional(Type.String({ description: "Optional plan path to attach to the run. If provided on stage, package states are initialized from the plan." })),
+	packageId: Type.Optional(Type.String({ description: "Package id to update." })),
+	packageStatus: Type.Optional(
+		StringEnum(["pending", "running", "completed", "failed", "blocked"] as const, {
+			description: "New package status for action package.",
 		}),
 	),
-	scoutTask: Type.Optional(Type.String({ description: "Optional custom scout instruction. If omitted, the runtime generates one from the objective." })),
-});
-
-const ExecutePlanParams = Type.Object({
-	feature: Type.Optional(Type.String({ description: "Feature name or feature slug. Used to resolve the latest plan version when planPath is omitted." })),
-	planPath: Type.Optional(Type.String({ description: "Optional explicit path to a plan file. If omitted, the runtime resolves the latest plan for the feature." })),
-	packageIds: Type.Optional(Type.Array(Type.String({ description: "Optional subset of package ids to execute from the plan." }))),
+	changedFiles: Type.Optional(Type.Array(Type.String({ description: "Files actually changed by the completed package." }))),
+	verdict: Type.Optional(
+		StringEnum(["pass", "pass_with_warnings", "fail"] as const, {
+			description: "Review verdict for action review.",
+		}),
+	),
+	routingHint: Type.Optional(
+		StringEnum(["none", "engineer", "designer", "both"] as const, {
+			description: "Reviewer routing hint for action review.",
+		}),
+	),
+	needRescout: Type.Optional(Type.Boolean({ description: "Whether reviewer requested a new scout pass." })),
+	reportPath: Type.Optional(Type.String({ description: "Optional report path, usually from a scout or review delegate result." })),
+	finalStatus: Type.Optional(
+		StringEnum(["completed", "failed", "stale"] as const, {
+			description: "Final run status for action finish.",
+		}),
+	),
 });
 
 const DocsLookupParams = Type.Object({
 	query: Type.Optional(Type.String({ description: "Search query for framework or library documentation." })),
 	url: Type.Optional(Type.String({ description: "Direct documentation URL to fetch." })),
-});
-
-const RunFeatureParams = Type.Object({
-	feature: Type.String({ description: "Feature name or feature slug." }),
-	objective: Type.String({ description: "End-to-end objective for planning, execution, and review." }),
-	scoutMode: Type.Optional(
-		StringEnum(["auto", "run", "skip"] as const, {
-			description: "Whether to run scout before planner. Use run for complex work, skip for tiny local work, auto for runtime heuristic.",
-		}),
-	),
-	maxReviewLoops: Type.Optional(Type.Number({ description: "Maximum review/repair loops. Defaults to 3.", minimum: 1, maximum: 3 })),
 });
 
 function resolveEffectiveRole(): AgentRole | undefined {
@@ -154,75 +183,336 @@ function resolveOptionalUserPath(cwd: string, input?: string): string | undefine
 function syncTopLevelTools(pi: ExtensionAPI): void {
 	if (runtimeRole) return;
 	const activeTools = new Set(pi.getActiveTools());
-	for (const toolName of [DELEGATE_TOOL_NAME, PLAN_FEATURE_TOOL_NAME, EXECUTE_PLAN_TOOL_NAME, DOCS_LOOKUP_TOOL_NAME, RUN_FEATURE_TOOL_NAME]) {
+	for (const toolName of [DELEGATE_TOOL_NAME, INSPECT_PLAN_TOOL_NAME, MANAGE_RUN_TOOL_NAME, DOCS_LOOKUP_TOOL_NAME]) {
 		if (modeState.enabled) activeTools.add(toolName);
 		else activeTools.delete(toolName);
 	}
 	pi.setActiveTools(Array.from(activeTools));
 }
 
-function shouldRunScout(objective: string, scoutMode: "auto" | "run" | "skip"): boolean {
-	if (scoutMode === "run") return true;
-	if (scoutMode === "skip") return false;
-
-	const normalized = objective.toLowerCase();
-	const heuristicTerms = [
-		"refactor",
-		"architecture",
-		"migrate",
-		"framework",
-		"integration",
-		"security",
-		"unknown",
-		"explore",
-		"analyze",
-		"research",
-		"multiple files",
-		"parallel",
-		"docs",
-	];
-	return objective.length > 140 || heuristicTerms.some((term) => normalized.includes(term));
+function summarizeText(value: string, lineCount = 3): string {
+	const lines = value
+		.split("\n")
+		.map((line) => line.trimEnd())
+		.filter(Boolean)
+		.slice(0, lineCount);
+	return lines.join("\n");
 }
 
-function buildDefaultScoutTask(feature: string, objective: string): string {
-	return [
-		`Analyze the project codebase for feature: ${feature}`,
-		`Objective: ${objective}`,
-		"Validate relevant framework or library guidance against current documentation when possible.",
-		"Return compressed findings for the planner, including likely files to change, affected files, risks, and implementation boundaries.",
-	].join("\n");
+function relativePath(cwd: string, filePath?: string): string | undefined {
+	if (!filePath) return undefined;
+	const relative = path.relative(cwd, filePath);
+	return relative && !relative.startsWith("..") ? relative : filePath;
 }
 
-function buildWorkerTask(plan: ParsedPlan, pkg: PlanPackage): string {
-	return [
-		`Execute work package ${pkg.packageId} from the validated plan.`,
-		`Plan path: ${plan.path}`,
-		`Feature slug: ${plan.frontmatter.feature_slug}`,
-		`Plan version: ${plan.frontmatter.plan_version}`,
-		`Owner: ${pkg.owner}`,
-		`Goal: ${pkg.goal}`,
-		`Files To Change: ${pkg.filesToChange.length > 0 ? pkg.filesToChange.join(", ") : "none"}`,
-		`Affected Files: ${pkg.affectedFiles.length > 0 ? pkg.affectedFiles.join(", ") : "none"}`,
-		`Depends On: ${pkg.dependsOn.length > 0 ? pkg.dependsOn.join(", ") : "none"}`,
-		`Acceptance Checks: ${pkg.acceptanceChecks.length > 0 ? pkg.acceptanceChecks.join("; ") : "none"}`,
-		"Read the plan file and only the local files needed for this package.",
-		"Implement only this package. Do not perform broad repo analysis.",
-	].join("\n");
+function compactPath(cwd: string, filePath?: string, segmentCount = 3): string | undefined {
+	const relative = relativePath(cwd, filePath);
+	if (!relative) return undefined;
+	const parts = relative.split(/[\\/]/).filter(Boolean);
+	return parts.length <= segmentCount ? relative : `…/${parts.slice(-segmentCount).join("/")}`;
 }
 
-function linkAbortSignals(parent: AbortSignal | undefined, child: AbortController): void {
-	if (!parent) return;
-	if (parent.aborted) child.abort();
-	else parent.addEventListener("abort", () => child.abort(), { once: true });
+function packageCounts(manifest: RunManifest) {
+	const counts = { pending: 0, running: 0, completed: 0, failed: 0, blocked: 0 };
+	for (const pkg of manifest.packages) counts[pkg.status] += 1;
+	return counts;
 }
 
-function selectPackageIdsForRouting(plan: ParsedPlan, routingHint: ReviewVerdict["routingHint"]): string[] | undefined {
-	if (routingHint === "none" || routingHint === "both") return undefined;
-	const packageIds = plan.packages.filter((pkg) => pkg.owner === routingHint).map((pkg) => pkg.packageId);
-	return packageIds.length > 0 ? packageIds : undefined;
+function activeSubagents(manifest: RunManifest) {
+	return manifest.subagents.filter((subagent) => subagent.status === "running");
+}
+
+function statusIcon(status: RunManifest["status"] | DelegateToolDetails["status"] | "completed" | "failed"): string {
+	switch (status) {
+		case "running":
+			return "…";
+		case "completed":
+		case "success":
+			return "✓";
+		case "failed":
+		case "error":
+			return "✗";
+		case "active":
+			return "●";
+		case "stale":
+			return "◌";
+		case "aborted":
+			return "○";
+		default:
+			return "○";
+	}
+}
+
+function badge(theme: any, color: string, label: string): string {
+	return theme.fg(color, theme.bold(`[${label}]`));
+}
+
+function visibleTextLength(value: string): number {
+	return value.replace(/\x1b\[[0-9;]*m/g, "").length;
+}
+
+function rightAlign(value: string, width: number): string {
+	const padding = Math.max(0, width - visibleTextLength(value));
+	return `${" ".repeat(padding)}${value}`;
+}
+
+function buildModeBadgeLine(theme: any, manifest: RunManifest | undefined, enabled: boolean): string | undefined {
+	if (!enabled) return undefined;
+	const pills: string[] = [];
+	if (manifest && manifest.status === "active") {
+		const counts = packageCounts(manifest);
+		if (counts.failed > 0) pills.push(badge(theme, "error", `✗ ${counts.failed}`));
+		if (counts.running > 0) pills.push(badge(theme, "warning", `… ${counts.running}`));
+		if (counts.completed > 0 && (manifest.stage === "review" || manifest.stage === "repair" || manifest.stage === "execution")) {
+			pills.push(badge(theme, "success", `✓ ${counts.completed}`));
+		}
+		for (const subagent of activeSubagents(manifest).slice(0, 2)) {
+			pills.push(badge(theme, "warning", subagent.packageId ? `${subagent.role.toUpperCase()} ${subagent.packageId}` : subagent.role.toUpperCase()));
+		}
+		pills.push(badge(theme, "muted", effectiveStageLabel(manifest)));
+	}
+	pills.push(badge(theme, "accent", "ORCH"));
+	return pills.join(" ");
+}
+
+function applyRunVisualization(ctx: any, manifest: RunManifest | undefined, enabled: boolean): void {
+	if (!ctx.hasUI) return;
+	if (!enabled) {
+		ctx.ui.setWidget(SMALLDOEN_RUN_WIDGET_KEY, undefined);
+		return;
+	}
+	ctx.ui.setWidget(SMALLDOEN_RUN_WIDGET_KEY, (_tui: any, theme: any) => ({
+		render(width: number): string[] {
+			const line = buildModeBadgeLine(theme, manifest, enabled);
+			return line ? [rightAlign(line, width)] : [];
+		},
+		invalidate() {},
+	}));
+}
+
+function setActiveRun(manifest: RunManifest | undefined): void {
+	activeRunId = manifest?.status === "active" ? manifest.runId : undefined;
+}
+
+async function refreshRunVisualization(ctx: any): Promise<void> {
+	if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) {
+		resetLiveSubagents();
+		setActiveRun(undefined);
+		applyRunVisualization(ctx, undefined, false);
+		return;
+	}
+	const manifest = await loadLatestRunManifest(ctx.cwd);
+	const activeManifest = manifest?.status === "active" ? manifest : undefined;
+	if (!activeManifest) resetLiveSubagents();
+	setActiveRun(activeManifest);
+	applyRunVisualization(ctx, activeManifest, true);
+}
+
+function ensureConfigPresent(cwd: string): void {
+	if (hasSmalldoenConfig(cwd)) return;
+	throw new Error(`Missing orchestration config: ${getConfigPath(cwd)}. Create .pi/smalldoen.json first.`);
+}
+
+function liveSubagentKey(input: { runId?: string; role: WorkerRole; packageId?: string; label?: string }): string {
+	return `${input.runId ?? "run"}:${input.role}:${input.packageId ?? input.label ?? input.role}`;
+}
+
+function resetLiveSubagents(): void {
+	for (const overlay of liveSubagentOverlays.values()) overlay.handle.hide();
+	liveSubagentOverlays.clear();
+	liveSubagents.clear();
+	liveSubagentOrder.splice(0, liveSubagentOrder.length);
+}
+
+function upsertLiveSubagent(input: {
+	runId?: string;
+	role: WorkerRole;
+	label?: string;
+	packageId?: string;
+	status: DelegateToolDetails["status"];
+	model?: string;
+	output?: string;
+}): LiveSubagentState {
+	const key = liveSubagentKey(input);
+	const existing = liveSubagents.get(key);
+	if (!existing) liveSubagentOrder.push(key);
+	const state: LiveSubagentState = {
+		key,
+		slot: existing?.slot ?? liveSubagentOrder.indexOf(key) + 1,
+		role: input.role,
+		label: input.label?.trim() || input.packageId?.trim() || input.role,
+		packageId: input.packageId?.trim() || existing?.packageId,
+		runId: input.runId ?? existing?.runId,
+		status: input.status,
+		model: input.model ?? existing?.model,
+		output: input.output ?? existing?.output ?? "",
+		updatedAt: new Date().toISOString(),
+	};
+	liveSubagents.set(key, state);
+	return state;
+}
+
+function getLiveSubagentForSlot(slot: number): LiveSubagentState | undefined {
+	const key = liveSubagentOrder[slot - 1];
+	return key ? liveSubagents.get(key) : undefined;
+}
+
+function refreshLiveSubagentOverlays(): void {
+	for (const overlay of liveSubagentOverlays.values()) overlay.panel.invalidate();
+}
+
+function effectiveStageLabel(manifest: RunManifest): string {
+	const roles = new Set(activeSubagents(manifest).map((subagent) => subagent.role));
+	if (roles.has("engineer") && !roles.has("designer") && roles.size === 1) return "ENGINEERING";
+	if (roles.has("designer") && !roles.has("engineer") && roles.size === 1) return "DESIGNING";
+	if (roles.has("engineer") || roles.has("designer")) return "EXECUTING";
+	if (roles.has("scout") && roles.size === 1) return "SCOUTING";
+	if (roles.has("planner") && roles.size === 1) return "PLANNING";
+	if (roles.has("reviewer") && roles.size === 1) return "REVIEWING";
+	return manifest.stage.toUpperCase();
+}
+
+class SubagentOverlayPanel {
+	constructor(
+		private readonly tui: any,
+		private readonly theme: any,
+		private readonly slot: number,
+		private readonly getState: () => LiveSubagentState | undefined,
+	) {}
+
+	invalidate(): void {
+		this.tui.requestRender();
+	}
+
+	render(width: number): string[] {
+		const state = this.getState();
+		if (!state) return [];
+		const innerWidth = Math.max(30, width - 2);
+		const pad = (line: string) => line + " ".repeat(Math.max(0, innerWidth - visibleWidth(line)));
+		const row = (line = "") => `${this.theme.fg("dim", "│")}${pad(line)}${this.theme.fg("dim", "│")}`;
+		const lines: string[] = [];
+		lines.push(this.theme.fg("dim", `╭${"─".repeat(innerWidth)}╮`));
+		lines.push(row(` ${this.theme.fg("accent", this.theme.bold(`SUBAGENT ${this.slot}`))} ${this.theme.fg("toolTitle", `${state.label} → ${state.role}`)}`));
+		lines.push(row(` ${this.theme.fg(state.status === "running" ? "warning" : state.status === "success" ? "success" : "error", state.status.toUpperCase())}${state.model ? this.theme.fg("dim", `  ${state.model}`) : ""}`));
+		if (state.runId) lines.push(row(` ${this.theme.fg("dim", `run ${state.runId}`)}`));
+		lines.push(row(""));
+		const content = state.output?.trim() ? state.output.trim() : "(waiting for subagent output...)";
+		for (const line of content.split("\n").slice(-14)) {
+			lines.push(row(` ${truncateToWidth(line, innerWidth - 2, "")}`));
+		}
+		lines.push(this.theme.fg("dim", `╰${"─".repeat(innerWidth)}╯`));
+		return lines;
+	}
+	dispose(): void {}
+}
+
+async function toggleSubagentOverlay(slot: number, ctx: any): Promise<void> {
+	const existing = liveSubagentOverlays.get(slot);
+	if (existing) {
+		existing.handle.hide();
+		liveSubagentOverlays.delete(slot);
+		return;
+	}
+	const state = getLiveSubagentForSlot(slot);
+	if (!state) {
+		ctx.ui.notify(`No subagent mapped to Ctrl+Shift+${slot}.`, "info");
+		return;
+	}
+	let panel: SubagentOverlayPanel | undefined;
+	void ctx.ui.custom(
+		(tui: any, theme: any, _keybindings: any, _done: () => void) => {
+			panel = new SubagentOverlayPanel(tui, theme, slot, () => getLiveSubagentForSlot(slot));
+			return panel;
+		},
+		{
+			overlay: true,
+			overlayOptions: {
+				anchor: "top-right",
+				width: "48%",
+				maxHeight: "45%",
+				margin: { top: 2 + (slot - 1) * 2, right: 2 },
+			},
+			onHandle: (handle: any) => {
+				if (panel) liveSubagentOverlays.set(slot, { handle, panel, stateKey: state.key });
+			},
+		},
+	).finally(() => {
+		liveSubagentOverlays.delete(slot);
+	});
+}
+
+async function writeReport(filePath: string, content: string): Promise<void> {
+	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await fs.writeFile(filePath, content, "utf8");
+}
+
+async function loadRunManifestRequired(cwd: string, runId: string): Promise<RunManifest> {
+	const manifest = await loadRunManifest(cwd, runId);
+	if (!manifest) throw new Error(`Run manifest not found: ${runId}`);
+	return manifest;
+}
+
+function buildPackageStates(plan: ParsedPlan): Array<Omit<RunPackageState, "updatedAt">> {
+	return plan.packages.map((pkg) => ({
+		packageId: pkg.packageId,
+		owner: pkg.owner,
+		goal: pkg.goal,
+		status: "pending",
+	}));
+}
+
+function buildReviewSummary(output: string): ReviewSummary {
+	const parsed = parseReviewOutput(output);
+	return {
+		verdict: parsed.verdict,
+		routingHint: parsed.routingHint,
+		needRescout: parsed.needRescout,
+		summary: parsed.summary,
+	};
+}
+
+function buildPlanInspectionDetails(plan: ParsedPlan, packageIds?: string[]): PlanInspectionDetails {
+	const groups = schedulePackages(plan, packageIds);
+	return {
+		featureSlug: plan.frontmatter.feature_slug,
+		planPath: plan.path,
+		parallelAllowed: plan.frontmatter.parallel_allowed,
+		packageCount: packageIds?.length ? groups.reduce((count, group) => count + group.packages.length, 0) : plan.packages.length,
+		groups: groups.map((group) => ({ index: group.index, packageIds: group.packages.map((pkg) => pkg.packageId) })),
+		packages: plan.packages.map((pkg) => ({
+			packageId: pkg.packageId,
+			owner: pkg.owner,
+			goal: pkg.goal,
+			filesToChange: pkg.filesToChange,
+			affectedFiles: pkg.affectedFiles,
+			dependsOn: pkg.dependsOn,
+			parallelSafe: pkg.parallelSafe,
+			acceptanceChecks: pkg.acceptanceChecks,
+		})),
+	};
+}
+
+function buildManageRunDetails(action: ManageRunDetails["action"], manifest: RunManifest): ManageRunDetails {
+	const counts = packageCounts(manifest);
+	return {
+		action,
+		runId: manifest.runId,
+		feature: manifest.feature,
+		featureSlug: manifest.featureSlug,
+		status: manifest.status,
+		stage: manifest.stage,
+		updatedAt: manifest.updatedAt,
+		planPath: manifest.planPath,
+		review: manifest.review,
+		packageCount: manifest.packages.length,
+		activeSubagentCount: activeSubagents(manifest).length,
+		completedPackageCount: counts.completed,
+		failedPackageCount: counts.failed,
+	};
 }
 
 function formatManifestSummary(manifest: RunManifest): string {
+	const counts = packageCounts(manifest);
 	const lines = [
 		`Run ID: ${manifest.runId}`,
 		`Status: ${manifest.status}`,
@@ -231,244 +521,84 @@ function formatManifestSummary(manifest: RunManifest): string {
 		`Objective: ${manifest.objective}`,
 		`Plan: ${manifest.planPath ?? "(none)"}`,
 		`Scout used: ${manifest.scoutUsed ? "yes" : "no"}`,
-		`Review loops: ${manifest.reviewLoops}`,
 		`Updated: ${manifest.updatedAt}`,
+		`Packages: total ${manifest.packages.length} | completed ${counts.completed} | running ${counts.running} | failed ${counts.failed} | pending ${counts.pending} | blocked ${counts.blocked}`,
 	];
 	if (manifest.staleReason) lines.push(`Stale reason: ${manifest.staleReason}`);
-	if (manifest.review) lines.push(`Review verdict: ${manifest.review.verdict}`);
-	if (manifest.execution) lines.push(`Executed packages: ${manifest.execution.results.length}`);
+	if (manifest.review) lines.push(`Review verdict: ${manifest.review.verdict} (${manifest.review.routingHint})`);
+	if (manifest.packages.length > 0) {
+		lines.push("", "Package Status:");
+		for (const pkg of manifest.packages) {
+			lines.push(`- ${pkg.packageId} [${pkg.status}]${pkg.owner ? ` (${pkg.owner})` : ""}${pkg.goal ? ` ${pkg.goal}` : ""}`);
+		}
+	}
+	if (manifest.subagents.length > 0) {
+		lines.push("", "Recent Subagents:");
+		for (const subagent of manifest.subagents.slice(0, 8)) {
+			lines.push(`- [${subagent.updatedAt}] ${subagent.role} ${subagent.label} -> ${subagent.status}`);
+		}
+	}
 	if (manifest.events.length > 0) {
 		lines.push("", "Recent events:");
-		for (const event of manifest.events.slice(-8)) {
-			lines.push(`- [${event.timestamp}] ${event.type}: ${event.message}`);
-		}
+		for (const event of manifest.events.slice(-10)) lines.push(`- [${event.timestamp}] ${event.type}: ${event.message}`);
 	}
 	return lines.join("\n");
 }
 
-async function writeReport(filePath: string, content: string): Promise<void> {
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	await fs.writeFile(filePath, content, "utf8");
-}
+function renderDelegateResult(details: DelegateToolDetails, expanded: boolean, isPartial: boolean, theme: any) {
+	const status = isPartial ? "running" : details.status;
+	const statusColor = status === "success" ? "success" : status === "running" ? "warning" : status === "aborted" ? "muted" : "error";
+	const metaBits = [
+		theme.fg(statusColor, statusIcon(status)),
+		details.model ? theme.fg("dim", details.model) : undefined,
+		details.runId ? theme.fg("dim", details.runId) : undefined,
+	].filter(Boolean).join("  ");
+	const preview = details.finalOutput ? summarizeText(details.finalOutput, 4) : "(running...)";
+	if (!expanded) return new Text(`${metaBits}\n${theme.fg("toolOutput", preview)}`, 0, 0);
 
-async function markActiveRunAsStale(cwd: string, reason: string): Promise<void> {
-	if (!activeRun) return;
-	activeRun = await markRunStale(cwd, activeRun, reason);
-}
-
-function clearActiveRun(): void {
-	activeRun = undefined;
-	activeRunAbortController = undefined;
-}
-
-interface PlanStageResult {
-	parsedPlan: ParsedPlan;
-	details: PlanFeatureDetails;
-}
-
-async function runPlanFeatureStage(input: {
-	cwd: string;
-	feature: string;
-	objective: string;
-	scoutMode: "auto" | "run" | "skip";
-	scoutTask?: string;
-	signal?: AbortSignal;
-	onUpdate?: (message: string, details?: unknown) => void;
-	runId?: string;
-}): Promise<PlanStageResult> {
-	const scoutUsed = shouldRunScout(input.objective, input.scoutMode);
-	let scoutSummary: string | undefined;
-
-	if (scoutUsed) {
-		const scoutResult = await runDelegatedRole({
-			cwd: input.cwd,
-			role: "scout",
-			task: input.scoutTask?.trim() || buildDefaultScoutTask(input.feature, input.objective),
-			signal: input.signal,
-			onUpdate: (details) => input.onUpdate?.(details.finalOutput || "(scout running...)", details),
-		});
-		scoutSummary = scoutResult.details.finalOutput;
-		if (input.runId) {
-			await writeReport(getScoutReportPath(input.cwd, input.runId), scoutSummary || "");
-		}
-	}
-
-	const plannerTask = [
-		`Create or version the implementation plan for feature: ${input.feature}`,
-		`Objective: ${input.objective}`,
-		scoutSummary ? `Scout findings:\n${scoutSummary}` : "Scout findings: skipped",
-		"Produce a deterministic plan with explicit work packages and scheduling metadata.",
-	].join("\n\n");
-
-	const plannerResult = await runDelegatedRole({
-		cwd: input.cwd,
-		role: "planner",
-		task: plannerTask,
-		feature: input.feature,
-		signal: input.signal,
-		onUpdate: (details) => input.onUpdate?.(details.finalOutput || "(planner running...)", details),
-	});
-
-	if (!plannerResult.parsedPlan) throw new Error("Planner did not return parsed plan metadata.");
-
-	const details: PlanFeatureDetails = {
-		scoutUsed,
-		featureSlug: plannerResult.parsedPlan.frontmatter.feature_slug || input.feature,
-		planPath: plannerResult.parsedPlan.path,
-		packageCount: plannerResult.parsedPlan.packages.length,
-		parallelAllowed: plannerResult.parsedPlan.frontmatter.parallel_allowed,
-		scoutSummary,
-		plannerSummary: plannerResult.details.finalOutput,
-	};
-	return { parsedPlan: plannerResult.parsedPlan, details };
-}
-
-async function runExecutePlanStage(input: {
-	cwd: string;
-	planPath: string;
-	packageIds?: string[];
-	signal?: AbortSignal;
-	onUpdate?: (message: string, details?: unknown) => void;
-}): Promise<ExecutePlanDetails> {
-	const plan = await loadParsedPlan(input.planPath);
-	const groups = schedulePackages(plan, input.packageIds);
-	const executedResults: ExecutedPackageDetails[] = [];
-
-	const emit = (message: string) => {
-		const details: ExecutePlanDetails = {
-			featureSlug: plan.frontmatter.feature_slug,
-			planPath: plan.path,
-			groupCount: groups.length,
-			packageCount: groups.reduce((count, group) => count + group.packages.length, 0),
-			groups: groups.map((group) => ({ index: group.index, packageIds: group.packages.map((pkg) => pkg.packageId) })),
-			results: [...executedResults],
-		};
-		input.onUpdate?.(message, details);
-	};
-
-	for (const group of groups) {
-		emit(`Executing group ${group.index}/${groups.length}: ${group.packages.map((pkg) => pkg.packageId).join(", ")}`);
-		const settled = await Promise.allSettled(
-			group.packages.map((pkg) =>
-				runDelegatedRole({
-					cwd: input.cwd,
-					role: pkg.owner as WorkerRole,
-					task: buildWorkerTask(plan, pkg),
-					signal: input.signal,
-					onUpdate: (details) => emit(`${pkg.packageId} (${pkg.owner}) running` + (details.finalOutput ? `\n\n${details.finalOutput}` : "")),
-				}),
-			),
-		);
-
-		const errors: string[] = [];
-		for (let index = 0; index < settled.length; index++) {
-			const outcome = settled[index];
-			const pkg = group.packages[index];
-			if (outcome.status === "rejected") {
-				errors.push(`${pkg.packageId}: ${outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)}`);
-				continue;
-			}
-			executedResults.push({
-				packageId: pkg.packageId,
-				owner: pkg.owner,
-				goal: pkg.goal,
-				filesToChange: pkg.filesToChange,
-				affectedFiles: pkg.affectedFiles,
-				changedFiles: parseChangedFiles(outcome.value.details.finalOutput),
-				exitCode: outcome.value.details.exitCode,
-				finalOutput: outcome.value.details.finalOutput,
-				stderr: outcome.value.details.stderr,
-				model: outcome.value.details.model,
-			});
-		}
-
-		if (errors.length > 0) throw new Error(`Execution failed in group ${group.index}: ${errors.join(" | ")}`);
-	}
-
-	return {
-		featureSlug: plan.frontmatter.feature_slug,
-		planPath: plan.path,
-		groupCount: groups.length,
-		packageCount: groups.reduce((count, group) => count + group.packages.length, 0),
-		groups: groups.map((group) => ({ index: group.index, packageIds: group.packages.map((pkg) => pkg.packageId) })),
-		results: executedResults,
-	};
-}
-
-async function runReviewStage(input: {
-	cwd: string;
-	runId: string;
-	planPath: string;
-	execution: ExecutePlanDetails;
-	signal?: AbortSignal;
-	onUpdate?: (message: string, details?: unknown) => void;
-}): Promise<{ details: ReviewExecutionDetails; verdict: ReviewVerdict }> {
-	const plan = await loadParsedPlan(input.planPath);
-	const reviewTask = buildReviewTask({ runId: input.runId, plan, results: input.execution.results });
-	const reviewerResult = await runDelegatedRole({
-		cwd: input.cwd,
-		role: "reviewer",
-		task: reviewTask,
-		signal: input.signal,
-		onUpdate: (delegateDetails) => input.onUpdate?.(delegateDetails.finalOutput || "(reviewer running...)", delegateDetails),
-	});
-	const verdict = parseReviewOutput(reviewerResult.details.finalOutput);
-	const reportPath = getReviewReportPath(input.cwd, input.runId);
-	await writeReport(reportPath, reviewerResult.details.finalOutput || "");
-	return {
-		verdict,
-		details: {
-			runId: input.runId,
-			featureSlug: plan.frontmatter.feature_slug,
-			planPath: plan.path,
-			reportPath,
-			verdict: verdict.verdict,
-			routingHint: verdict.routingHint,
-			needRescout: verdict.needRescout,
-			summary: verdict.summary,
-			filesReviewed: verdict.filesReviewed,
-			criticalIssueCount: verdict.criticalIssues.length,
-			warningCount: verdict.warnings.length,
-		},
-	};
-}
-
-function renderDelegateResult(details: DelegateToolDetails, expanded: boolean, theme: any) {
-	const icon = details.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
-	const header = `${icon} ${theme.fg("toolTitle", theme.bold(details.role))}${details.planPath ? theme.fg("dim", `  ${details.planPath}`) : ""}`;
-	if (!expanded) {
-		const preview = details.finalOutput ? details.finalOutput.split("\n").slice(0, 3).join("\n") : "(no output)";
-		return new Text(`${header}\n${theme.fg("toolOutput", preview)}`, 0, 0);
-	}
 	const container = new Container();
-	container.addChild(new Text(header, 0, 0));
-	if (details.featureSlug) container.addChild(new Text(theme.fg("dim", `feature: ${details.featureSlug}`), 0, 0));
-	if (details.model) container.addChild(new Text(theme.fg("dim", `model: ${details.model}`), 0, 0));
-	if (details.planPath) container.addChild(new Text(theme.fg("dim", `plan: ${details.planPath}`), 0, 0));
+	container.addChild(new Text(metaBits, 0, 0));
+	if (details.reportPath) container.addChild(new Text(theme.fg("dim", `report ${details.reportPath}`), 0, 0));
+	if (details.changedFiles && details.changedFiles.length > 0) container.addChild(new Text(theme.fg("muted", `files ${details.changedFiles.join(", ")}`), 0, 0));
+	if (details.review) container.addChild(new Text(theme.fg("muted", `review ${details.review.verdict} / ${details.review.routingHint}`), 0, 0));
 	if (details.stderr) container.addChild(new Text(theme.fg("warning", details.stderr.trim()), 0, 0));
 	container.addChild(new Spacer(1));
-	container.addChild(new Markdown(details.finalOutput || "(no output)", 0, 0, getMarkdownTheme()));
+	container.addChild(new Markdown(details.finalOutput || (status === "running" ? "(running...)" : "(no output)"), 0, 0, getMarkdownTheme()));
 	return container;
 }
 
-function renderExecutePlanResult(details: ExecutePlanDetails, expanded: boolean, theme: any) {
-	const header = `${theme.fg("success", "✓")} ${theme.fg("toolTitle", theme.bold("execute_plan"))}${theme.fg("dim", `  ${details.planPath}`)}`;
+function renderInspectPlanResult(details: PlanInspectionDetails, expanded: boolean, theme: any) {
+	const header = `${theme.fg("success", "✓")} ${theme.fg("toolTitle", theme.bold("inspect_plan"))}${theme.fg("dim", `  ${details.planPath}`)}`;
 	if (!expanded) {
-		return new Text(`${header}\n${theme.fg("dim", `groups:${details.groupCount} packages:${details.packageCount} completed:${details.results.length}`)}`, 0, 0);
+		return new Text(`${header}\n${theme.fg("dim", `packages:${details.packageCount} groups:${details.groups.length} parallel:${details.parallelAllowed ? "yes" : "no"}`)}`, 0, 0);
 	}
-	const container = new Container();
-	container.addChild(new Text(header, 0, 0));
-	container.addChild(new Text(theme.fg("dim", `feature: ${details.featureSlug}`), 0, 0));
-	container.addChild(new Text(theme.fg("dim", `groups: ${details.groupCount}`), 0, 0));
-	container.addChild(new Text(theme.fg("dim", `packages: ${details.packageCount}`), 0, 0));
-	container.addChild(new Spacer(1));
-	for (const group of details.groups) container.addChild(new Text(theme.fg("muted", `Group ${group.index}: ${group.packageIds.join(", ")}`), 0, 0));
-	for (const result of details.results) {
-		container.addChild(new Spacer(1));
-		container.addChild(new Text(`${result.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗")} ${theme.fg("accent", result.packageId)} ${theme.fg("dim", `(${result.owner}) ${result.goal}`)}`, 0, 0));
-		container.addChild(new Markdown(result.finalOutput || "(no output)", 0, 0, getMarkdownTheme()));
-	}
-	return container;
+	const lines = [
+		header,
+		`feature: ${details.featureSlug}`,
+		`parallel allowed: ${details.parallelAllowed ? "yes" : "no"}`,
+		"",
+		"Groups:",
+		...details.groups.map((group) => `- Group ${group.index}: ${group.packageIds.join(", ")}`),
+		"",
+		"Packages:",
+		...details.packages.map((pkg) => `- ${pkg.packageId} (${pkg.owner}) ${pkg.goal}`),
+	];
+	return new Markdown(lines.join("\n"), 0, 0, getMarkdownTheme());
+}
+
+function renderManageRunResult(details: ManageRunDetails, expanded: boolean, theme: any) {
+	const summary = [
+		theme.fg("muted", `[○ ${details.packageCount}]`),
+		theme.fg("success", `[✓ ${details.completedPackageCount}]`),
+		theme.fg("error", `[✗ ${details.failedPackageCount}]`),
+	].join(" ");
+	if (!expanded) return new Text(summary, 0, 0);
+	const lines = [
+		summary,
+		theme.fg("dim", `stage ${details.stage}`),
+		details.review ? theme.fg("dim", `review ${details.review.verdict} / ${details.review.routingHint}`) : undefined,
+	].filter(Boolean).join("\n");
+	return new Text(lines, 0, 0);
 }
 
 async function applyConfiguredOrchestratorModel(pi: ExtensionAPI, ctx: any, state: OrchestrationModeState): Promise<void> {
@@ -514,6 +644,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		restoreOrchestrationMode(ctx, modeState);
 		syncTopLevelTools(pi);
 		if (modeState.enabled && !runtimeRole) await applyConfiguredOrchestratorModel(pi, ctx, modeState);
+		await refreshRunVisualization(ctx);
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
@@ -521,14 +652,33 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		restoreOrchestrationMode(ctx, modeState);
 		syncTopLevelTools(pi);
 		if (modeState.enabled && !runtimeRole) await applyConfiguredOrchestratorModel(pi, ctx, modeState);
+		await refreshRunVisualization(ctx);
 	});
 
 	pi.on("input", async (event, ctx) => {
 		if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) return { action: "continue" as const };
-		if (!activeRun || !event.text.trim()) return { action: "continue" as const };
-		if (event.text.trim().startsWith("/orch")) return { action: "continue" as const };
-		await markActiveRunAsStale(ctx.cwd, `Superseded by new user input: ${event.text.trim().slice(0, 200)}`);
-		activeRunAbortController?.abort();
+		const text = event.text.trim();
+		if (!text) return { action: "continue" as const };
+		const allowedWithoutConfig = ["/orch", "/reload", "/smalldoen-status"];
+		if (!hasSmalldoenConfig(ctx.cwd)) {
+			if (!allowedWithoutConfig.some((command) => text === command || text.startsWith(`${command} `))) {
+				const configPath = path.relative(ctx.cwd, getConfigPath(ctx.cwd)) || ".pi/smalldoen.json";
+				ctx.ui.notify(`Missing ${configPath}. Create it before using orchestration mode.`, "error");
+				ctx.ui.setEditorText(`Create ${configPath} first, then try again.`);
+				return { action: "handled" as const };
+			}
+			return { action: "continue" as const };
+		}
+		if (text.startsWith("/orch")) return { action: "continue" as const };
+		if (!activeRunId) return { action: "continue" as const };
+		const manifest = await loadRunManifest(ctx.cwd, activeRunId);
+		if (manifest && manifest.status === "active") {
+			const stale = await markRunStale(ctx.cwd, manifest, `Superseded by new user input: ${event.text.trim().slice(0, 200)}`);
+			await appendRunEvent(ctx.cwd, stale, "run_stale", "Run marked stale because a new user instruction interrupted the workflow.");
+			resetLiveSubagents();
+			setActiveRun(undefined);
+			applyRunVisualization(ctx, stale, true);
+		}
 		if (!ctx.isIdle()) ctx.abort();
 		return { action: "continue" as const };
 	});
@@ -545,13 +695,10 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			if (command === "status") {
 				ctx.ui.notify(describeMode(current), "info");
 				applyModeIndicator(ctx, current);
+				await refreshRunVisualization(ctx);
 				return;
 			}
-			if ((command === "" || command === "toggle" || command === "off") && !ctx.isIdle()) {
-				if (activeRun) await markActiveRunAsStale(ctx.cwd, "Orchestration mode turned off during active run.");
-				activeRunAbortController?.abort();
-				ctx.abort();
-			}
+			if ((command === "" || command === "toggle" || command === "off") && !ctx.isIdle()) ctx.abort();
 			let next = current;
 			if (command === "on") next = true;
 			else if (command === "off") next = false;
@@ -563,6 +710,10 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			}
 			syncTopLevelTools(pi);
 			ctx.ui.notify(describeMode(next), "info");
+			if (next && !hasSmalldoenConfig(ctx.cwd)) {
+				ctx.ui.notify(`Missing ${path.relative(ctx.cwd, getConfigPath(ctx.cwd)) || ".pi/smalldoen.json"}. Create it before using orchestration mode.`, "warning");
+			}
+			await refreshRunVisualization(ctx);
 		},
 	});
 
@@ -575,9 +726,22 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 				return;
 			}
 			ctx.ui.setEditorText(formatManifestSummary(manifest));
+			applyRunVisualization(ctx, manifest, modeState.enabled);
 			ctx.ui.notify(`Loaded status for ${manifest.runId}`, "info");
 		},
 	});
+
+	if (!runtimeRole) {
+		for (let slot = 1; slot <= 9; slot++) {
+			pi.registerShortcut(`ctrl+shift+${slot}` as any, {
+				description: `Toggle smalldoen subagent panel ${slot}`,
+				handler: async (ctx) => {
+					if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) return;
+					await toggleSubagentOverlay(slot, ctx);
+				},
+			});
+		}
+	}
 
 	const shouldRegisterDocsLookup = !runtimeRole || runtimeRole === "scout";
 	if (shouldRegisterDocsLookup) {
@@ -609,347 +773,363 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 
 	if (!runtimeRole) {
 		pi.registerTool({
+			name: MANAGE_RUN_TOOL_NAME,
+			label: "Manage Run",
+			description: "Create or update the live orchestration run artifact. Use this to start runs, change stages, track package progress, store review outcomes, and finish runs.",
+			promptSnippet: "Create and update the live orchestration run state while you manage the workflow.",
+			promptGuidelines: [
+				"Use this tool before and during orchestration so the visible run status stays current.",
+				"Start a run before delegating work, update stage changes, and mark packages as running or completed as work progresses.",
+			],
+			parameters: ManageRunParams,
+			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+				if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) throw new Error("manage_run is available only when /orch mode is enabled.");
+				ensureConfigPresent(ctx.cwd);
+
+				if (params.action === "start") {
+					if (!params.feature?.trim() || !params.objective?.trim()) throw new Error("manage_run start requires feature and objective.");
+					if (activeRunId) {
+						const current = await loadRunManifest(ctx.cwd, activeRunId);
+						if (current && current.status === "active") {
+							await markRunStale(ctx.cwd, current, "Superseded by a new orchestration run.");
+						}
+					}
+					resetLiveSubagents();
+					let manifest = await createRunManifest(ctx.cwd, {
+						feature: params.feature,
+						featureSlug: slugifyFeatureName(params.feature),
+						objective: params.objective,
+						scoutUsed: false,
+					});
+					manifest = await appendRunEvent(ctx.cwd, manifest, "run_start", `Started orchestration run for ${params.feature}`);
+					setActiveRun(manifest);
+					applyRunVisualization(ctx, manifest, true);
+					const details = buildManageRunDetails("start", manifest);
+					return {
+						content: [{ type: "text", text: `Run started\nRun ID: ${manifest.runId}\nFeature: ${manifest.feature}\nStage: ${manifest.stage}` }],
+						details,
+					};
+				}
+
+				let manifest = params.runId ? await loadRunManifestRequired(ctx.cwd, params.runId) : await loadLatestRunManifest(ctx.cwd);
+				if (!manifest) throw new Error("No orchestration run found.");
+
+				if (params.action === "status") {
+					setActiveRun(manifest);
+					applyRunVisualization(ctx, manifest, true);
+					return { content: [{ type: "text", text: formatManifestSummary(manifest) }], details: buildManageRunDetails("status", manifest) };
+				}
+
+				if (params.action === "stage") {
+					if (!params.stage?.trim()) throw new Error("manage_run stage requires stage.");
+					const planPath = resolveOptionalUserPath(ctx.cwd, params.planPath) ?? manifest.planPath;
+					let nextManifest = await updateRunManifest(ctx.cwd, manifest, { stage: params.stage.trim(), planPath });
+					if (planPath && planPath !== manifest.planPath) {
+						const plan = await loadParsedPlan(planPath);
+						replacePackageStates(nextManifest, buildPackageStates(plan));
+						nextManifest = await updateRunManifest(ctx.cwd, nextManifest, { packages: nextManifest.packages, planPath: planPath, stage: params.stage.trim() });
+					}
+					if (params.note?.trim()) nextManifest = await appendRunEvent(ctx.cwd, nextManifest, "stage_change", params.note.trim(), { stage: params.stage.trim(), planPath });
+					setActiveRun(nextManifest);
+					applyRunVisualization(ctx, nextManifest, true);
+					return { content: [{ type: "text", text: formatManifestSummary(nextManifest) }], details: buildManageRunDetails("stage", nextManifest) };
+				}
+
+				if (params.action === "package") {
+					if (!params.packageId?.trim() || !params.packageStatus) throw new Error("manage_run package requires packageId and packageStatus.");
+					upsertPackageState(manifest, {
+						packageId: params.packageId.trim(),
+						status: params.packageStatus,
+						note: params.note?.trim(),
+						changedFiles: params.changedFiles,
+					});
+					let nextManifest = await updateRunManifest(ctx.cwd, manifest, { packages: manifest.packages });
+					nextManifest = await appendRunEvent(ctx.cwd, nextManifest, "package_update", `${params.packageId.trim()} -> ${params.packageStatus}`, {
+						packageId: params.packageId.trim(),
+						status: params.packageStatus,
+						changedFiles: params.changedFiles,
+					});
+					setActiveRun(nextManifest);
+					applyRunVisualization(ctx, nextManifest, true);
+					return { content: [{ type: "text", text: formatManifestSummary(nextManifest) }], details: buildManageRunDetails("package", nextManifest) };
+				}
+
+				if (params.action === "review") {
+					if (!params.verdict) throw new Error("manage_run review requires verdict.");
+					const reportPath = resolveOptionalUserPath(ctx.cwd, params.reportPath);
+					let nextManifest = await updateRunManifest(ctx.cwd, manifest, {
+						review: {
+							verdict: params.verdict,
+							routingHint: params.routingHint ?? "none",
+							needRescout: params.needRescout ?? false,
+							summary: params.note?.trim() || manifest.review?.summary || "",
+							reportPath,
+						},
+						stage: "review",
+					});
+					nextManifest = await appendRunEvent(ctx.cwd, nextManifest, "review_update", `Review verdict: ${params.verdict}`, {
+						verdict: params.verdict,
+						routingHint: params.routingHint ?? "none",
+						needRescout: params.needRescout ?? false,
+						reportPath,
+					});
+					setActiveRun(nextManifest);
+					applyRunVisualization(ctx, nextManifest, true);
+					return { content: [{ type: "text", text: formatManifestSummary(nextManifest) }], details: buildManageRunDetails("review", nextManifest) };
+				}
+
+				if (params.action === "finish") {
+					const finalStatus = params.finalStatus ?? "completed";
+					let nextManifest = manifest;
+					if (finalStatus === "stale") nextManifest = await markRunStale(ctx.cwd, manifest, params.note?.trim() || "Marked stale.");
+					else nextManifest = await markRunFinished(ctx.cwd, manifest, finalStatus);
+					nextManifest = await appendRunEvent(ctx.cwd, nextManifest, "run_end", params.note?.trim() || `Run finished with status ${finalStatus}.`);
+					if (finalStatus !== "stale") resetLiveSubagents();
+					setActiveRun(nextManifest.status === "active" ? nextManifest : undefined);
+					applyRunVisualization(ctx, nextManifest, true);
+					return { content: [{ type: "text", text: formatManifestSummary(nextManifest) }], details: buildManageRunDetails("finish", nextManifest) };
+				}
+
+				throw new Error(`Unsupported manage_run action: ${params.action}`);
+			},
+			renderCall(args, theme) {
+				const detail = args.stage ?? args.packageId ?? args.feature ?? "run";
+				const runId = args.runId ? ` ${args.runId}` : "";
+				return new Text(`${theme.fg("toolTitle", theme.bold("Executing "))}${theme.fg("accent", "[MANAGE_RUN]")} ${theme.fg("muted", args.action)} ${theme.fg("toolOutput", detail)}${theme.fg("dim", runId)}`, 0, 0);
+			},
+			renderResult(result, { expanded }, theme) {
+				const details = result.details as ManageRunDetails | undefined;
+				if (!details) return new Text(result.content[0]?.type === "text" ? result.content[0].text : "(no output)", 0, 0);
+				return renderManageRunResult(details, expanded, theme);
+			},
+		});
+
+		pi.registerTool({
+			name: INSPECT_PLAN_TOOL_NAME,
+			label: "Inspect Plan",
+			description: "Load a planner-generated plan file, parse its work packages, and return structured package and scheduling metadata. This does not execute anything.",
+			promptSnippet: "Inspect a planner-generated plan file and return packages plus safe parallel groups.",
+			promptGuidelines: [
+				"Use this after planner finishes so you can decide which packages to run next.",
+				"Only launch parallel worker delegates after you inspect the plan and intentionally choose a safe group.",
+			],
+			parameters: InspectPlanParams,
+			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+				if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) throw new Error("inspect_plan is available only when /orch mode is enabled.");
+				ensureConfigPresent(ctx.cwd);
+				const explicitPlanPath = resolveOptionalUserPath(ctx.cwd, params.planPath);
+				let planPath = explicitPlanPath;
+				if (!planPath) {
+					if (!params.feature?.trim()) throw new Error("inspect_plan requires either planPath or feature.");
+					planPath = await getLatestPlanPath(ctx.cwd, slugifyFeatureName(params.feature));
+					if (!planPath) throw new Error(`No plan found for feature: ${params.feature}`);
+				}
+				const plan = await loadParsedPlan(planPath);
+				const details = buildPlanInspectionDetails(plan, params.packageIds);
+				return {
+					content: [{ type: "text", text: [
+						`Plan path: ${details.planPath}`,
+						`Feature slug: ${details.featureSlug}`,
+						`Parallel allowed: ${details.parallelAllowed ? "yes" : "no"}`,
+						`Groups: ${details.groups.length}`,
+						`Packages: ${details.packageCount}`,
+						...details.groups.map((group) => `- Group ${group.index}: ${group.packageIds.join(", ")}`),
+					].join("\n") }],
+					details,
+				};
+			},
+			renderCall(args, theme) {
+				const label = args.planPath ? args.planPath : args.feature || "latest-plan";
+				return new Text(`${theme.fg("toolTitle", theme.bold("inspect_plan "))}${theme.fg("accent", label)}`, 0, 0);
+			},
+			renderResult(result, { expanded }, theme) {
+				const details = result.details as PlanInspectionDetails | undefined;
+				if (!details) return new Text(result.content[0]?.type === "text" ? result.content[0].text : "(no output)", 0, 0);
+				return renderInspectPlanResult(details, expanded, theme);
+			},
+		});
+
+		pi.registerTool({
 			name: DELEGATE_TOOL_NAME,
 			label: "Delegate",
-			description: "Run a specialized child role in an isolated pi subprocess. Roles: scout, planner, engineer, designer, reviewer. Planner requires the feature field so the runtime can version the plan path.",
-			promptSnippet: "Delegate targeted work to scout, planner, engineer, designer, or reviewer in isolated child pi processes.",
+			description: "Run a specialized child role in an isolated pi subprocess. Roles: scout, planner, engineer, designer, reviewer. Planner requires feature so the runtime can version the plan path.",
+			promptSnippet: "Delegate isolated work to scout, planner, engineer, designer, or reviewer.",
 			promptGuidelines: [
-				"Use this tool instead of implementing directly when orchestration mode is enabled.",
-				"Run planner before any engineer or designer implementation work.",
+				"Use this instead of implementing directly when orchestration mode is enabled.",
+				"Use planner before any engineer or designer work.",
+				"Pass runId and label so live run status stays visible while subagents work.",
 			],
 			parameters: DelegateParams,
 			async execute(_toolCallId, params, signal, onUpdate, ctx) {
 				if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) throw new Error("delegate is available only when /orch mode is enabled.");
-				const result = await runDelegatedRole({
-					cwd: ctx.cwd,
+				ensureConfigPresent(ctx.cwd);
+
+				const configuredRoleModel = getConfiguredModelSpec(ctx.cwd, params.role as WorkerRole);
+				upsertLiveSubagent({
+					runId: params.runId,
 					role: params.role as WorkerRole,
-					task: params.task,
-					feature: params.feature,
-					signal,
-					onUpdate: (details) => onUpdate?.({ content: [{ type: "text", text: details.finalOutput || `(${details.role} running...)` }], details }),
+					label: params.label,
+					packageId: params.packageId,
+					status: "running",
+					model: configuredRoleModel,
+					output: "",
 				});
-				return {
-					content: [{ type: "text", text: [
-						`Role: ${result.details.role}`,
-						result.details.planPath ? `Plan: ${result.details.planPath}` : undefined,
-						result.details.finalOutput || "(no output)",
-					].filter(Boolean).join("\n\n") }],
-					details: result.details,
-				};
-			},
-			renderCall(args, theme) {
-				const preview = args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task;
-				return new Text(`${theme.fg("toolTitle", theme.bold("delegate "))}${theme.fg("accent", args.role)}${theme.fg("dim", ` ${preview}`)}`, 0, 0);
-			},
-			renderResult(result, { expanded }, theme) {
-				const details = result.details as DelegateToolDetails | undefined;
-				if (!details) return new Text(result.content[0]?.type === "text" ? result.content[0].text : "(no output)", 0, 0);
-				return renderDelegateResult(details, expanded, theme);
-			},
-		});
-
-		pi.registerTool({
-			name: PLAN_FEATURE_TOOL_NAME,
-			label: "Plan Feature",
-			description: "Run the planning stage for a feature. The runtime optionally runs scout, then planner, versions the plan file, validates the plan, and returns parsed work-package metadata.",
-			promptSnippet: "Use this tool to create or version a feature plan before any implementation work.",
-			promptGuidelines: [
-				"Use this tool before engineer or designer work begins.",
-				"Set scoutMode to skip only for tiny, local, already-clear work.",
-			],
-			parameters: PlanFeatureParams,
-			async execute(_toolCallId, params, signal, onUpdate, ctx) {
-				if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) throw new Error("plan_feature is available only when /orch mode is enabled.");
-				const result = await runPlanFeatureStage({
-					cwd: ctx.cwd,
-					feature: params.feature,
-					objective: params.objective,
-					scoutMode: (params.scoutMode ?? "auto") as "auto" | "run" | "skip",
-					scoutTask: params.scoutTask,
-					signal,
-					onUpdate: (message, details) => onUpdate?.({ content: [{ type: "text", text: message }], details }),
+				refreshLiveSubagentOverlays();
+				onUpdate?.({
+					content: [{ type: "text", text: "(running...)" }],
+					details: {
+						role: params.role as WorkerRole,
+						status: "running",
+						runId: params.runId,
+						label: params.label?.trim() || params.packageId?.trim() || params.role,
+						packageId: params.packageId?.trim() || undefined,
+						exitCode: 0,
+						finalOutput: "",
+						model: configuredRoleModel,
+					},
 				});
-				await recordRoleExecution("orchestrator", ctx.cwd, {
-					task: `plan_feature: ${params.feature}`,
-					status: "success",
-					output: `Plan created at ${result.details.planPath}`,
-					metadata: { featureSlug: result.details.featureSlug, planPath: result.details.planPath },
-				});
-				const packageSummary = result.parsedPlan.packages.map((pkg) => `- ${pkg.packageId} (${pkg.owner}) ${pkg.goal}`).join("\n");
-				return {
-					content: [{ type: "text", text: [
-						`Feature slug: ${result.details.featureSlug}`,
-						`Plan path: ${result.details.planPath}`,
-						`Scout used: ${result.details.scoutUsed ? "yes" : "no"}`,
-						`Parallel allowed: ${result.details.parallelAllowed ? "yes" : "no"}`,
-						`Packages: ${result.details.packageCount}`,
-						packageSummary || "- no packages parsed",
-						"",
-						result.details.plannerSummary || "(no planner output)",
-					].join("\n") }],
-					details: result.details,
-				};
-			},
-			renderCall(args, theme) {
-				return new Text(`${theme.fg("toolTitle", theme.bold("plan_feature "))}${theme.fg("accent", args.feature)}${theme.fg("dim", ` [${args.scoutMode ?? "auto"}]`)}`, 0, 0);
-			},
-			renderResult(result, { expanded }, theme) {
-				const details = result.details as PlanFeatureDetails | undefined;
-				if (!details) return new Text(result.content[0]?.type === "text" ? result.content[0].text : "(no output)", 0, 0);
-				const header = `${theme.fg("success", "✓")} ${theme.fg("toolTitle", theme.bold("plan_feature"))}${theme.fg("dim", `  ${details.planPath}`)}`;
-				if (!expanded) return new Text(`${header}\n${theme.fg("dim", `packages:${details.packageCount} parallel:${details.parallelAllowed ? "yes" : "no"} scout:${details.scoutUsed ? "yes" : "no"}`)}`, 0, 0);
-				const container = new Container();
-				container.addChild(new Text(header, 0, 0));
-				container.addChild(new Text(theme.fg("dim", `feature: ${details.featureSlug}`), 0, 0));
-				container.addChild(new Text(theme.fg("dim", `packages: ${details.packageCount}`), 0, 0));
-				container.addChild(new Text(theme.fg("dim", `parallel allowed: ${details.parallelAllowed ? "yes" : "no"}`), 0, 0));
-				container.addChild(new Text(theme.fg("dim", `scout used: ${details.scoutUsed ? "yes" : "no"}`), 0, 0));
-				if (details.scoutSummary) {
-					container.addChild(new Spacer(1));
-					container.addChild(new Text(theme.fg("muted", "Scout Summary"), 0, 0));
-					container.addChild(new Markdown(details.scoutSummary, 0, 0, getMarkdownTheme()));
-				}
-				container.addChild(new Spacer(1));
-				container.addChild(new Text(theme.fg("muted", "Planner Summary"), 0, 0));
-				container.addChild(new Markdown(details.plannerSummary || "(no output)", 0, 0, getMarkdownTheme()));
-				return container;
-			},
-		});
-
-		pi.registerTool({
-			name: EXECUTE_PLAN_TOOL_NAME,
-			label: "Execute Plan",
-			description: "Execute work packages from a validated plan file. The runtime parses package metadata, groups parallel-safe packages, and delegates each package to engineer or designer child roles.",
-			promptSnippet: "Use this tool after plan_feature to execute plan packages from the latest or explicit plan file.",
-			promptGuidelines: [
-				"Use this tool only after a valid planner-generated plan exists.",
-				"Provide feature to resolve the latest plan version automatically.",
-			],
-			parameters: ExecutePlanParams,
-			async execute(_toolCallId, params, signal, onUpdate, ctx) {
-				if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) throw new Error("execute_plan is available only when /orch mode is enabled.");
-				const explicitPlanPath = resolveOptionalUserPath(ctx.cwd, params.planPath);
-				let resolvedPlanPath = explicitPlanPath;
-				if (!resolvedPlanPath) {
-					if (!params.feature?.trim()) throw new Error("execute_plan requires either planPath or feature.");
-					resolvedPlanPath = await getLatestPlanPath(ctx.cwd, slugifyFeatureName(params.feature));
-					if (!resolvedPlanPath) throw new Error(`No plan found for feature: ${params.feature}`);
-				}
-				const details = await runExecutePlanStage({
-					cwd: ctx.cwd,
-					planPath: resolvedPlanPath,
-					packageIds: params.packageIds,
-					signal,
-					onUpdate: (message, partial) => onUpdate?.({ content: [{ type: "text", text: message }], details: partial }),
-				});
-				await recordRoleExecution("orchestrator", ctx.cwd, {
-					task: `execute_plan: ${details.planPath}`,
-					status: "success",
-					output: `Executed ${details.packageCount} package(s) from ${details.planPath}`,
-					metadata: { featureSlug: details.featureSlug, planPath: details.planPath, packageCount: details.packageCount },
-				});
-				return { content: [{ type: "text", text: [
-					`Plan path: ${details.planPath}`,
-					`Feature slug: ${details.featureSlug}`,
-					`Groups executed: ${details.groupCount}`,
-					`Packages executed: ${details.packageCount}`,
-					...details.results.map((result) => `- ${result.packageId} (${result.owner}) ${result.goal}`),
-				].join("\n") }], details };
-			},
-			renderCall(args, theme) {
-				const label = args.planPath ? args.planPath : args.feature || "latest-plan";
-				return new Text(`${theme.fg("toolTitle", theme.bold("execute_plan "))}${theme.fg("accent", label)}`, 0, 0);
-			},
-			renderResult(result, { expanded }, theme) {
-				const details = result.details as ExecutePlanDetails | undefined;
-				if (!details) return new Text(result.content[0]?.type === "text" ? result.content[0].text : "(no output)", 0, 0);
-				return renderExecutePlanResult(details, expanded, theme);
-			},
-		});
-
-		pi.registerTool({
-			name: RUN_FEATURE_TOOL_NAME,
-			label: "Run Feature",
-			description: "Run the full feature workflow: optional scout, planner, worker execution, reviewer, and up to 3 repair loops with project-local run manifests and reports.",
-			promptSnippet: "Use this tool for the full end-to-end orchestration flow for a feature.",
-			promptGuidelines: [
-				"Use this tool when the user wants full end-to-end implementation flow.",
-				"This tool plans, executes, reviews, and retries fixes automatically up to the configured limit.",
-			],
-			parameters: RunFeatureParams,
-			async execute(_toolCallId, params, signal, onUpdate, ctx) {
-				if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) throw new Error("run_feature is available only when /orch mode is enabled.");
-				const scoutMode = (params.scoutMode ?? "auto") as "auto" | "run" | "skip";
-				const featureSlug = slugifyFeatureName(params.feature);
-				const scoutUsed = shouldRunScout(params.objective, scoutMode);
-				let manifest = await createRunManifest(ctx.cwd, {
-					feature: params.feature,
-					featureSlug,
-					objective: params.objective,
-					scoutUsed,
-				});
-				const controller = new AbortController();
-				linkAbortSignals(signal, controller);
-				activeRun = manifest;
-				activeRunAbortController = controller;
-
-				try {
-					await appendRunEvent(ctx.cwd, manifest, "run_start", `Started run for ${params.feature}`);
-					const planStage = await runPlanFeatureStage({
-						cwd: ctx.cwd,
-						feature: params.feature,
-						objective: params.objective,
-						scoutMode,
-						signal: controller.signal,
-						runId: manifest.runId,
-						onUpdate: (message, details) => onUpdate?.({ content: [{ type: "text", text: message }], details }),
+				let manifest = params.runId ? await loadRunManifest(ctx.cwd, params.runId) : undefined;
+				if (manifest) {
+					upsertSubagentState(manifest, {
+						role: params.role as WorkerRole,
+						label: params.label?.trim() || params.packageId?.trim() || params.role,
+						status: "running",
+						packageId: params.packageId?.trim() || undefined,
 					});
 					manifest = await updateRunManifest(ctx.cwd, manifest, {
-						stage: "execution",
-						planPath: planStage.details.planPath,
-						scoutUsed: planStage.details.scoutUsed,
+						scoutUsed: manifest.scoutUsed || params.role === "scout",
+						subagents: manifest.subagents,
 					});
-					await appendRunEvent(ctx.cwd, manifest, "plan_ready", `Plan ready at ${planStage.details.planPath}`, { planPath: planStage.details.planPath });
+					manifest = await appendRunEvent(ctx.cwd, manifest, "delegate_start", `Delegated ${params.label?.trim() || params.role} to ${params.role}.`, {
+						role: params.role,
+						label: params.label,
+						packageId: params.packageId,
+					});
+					setActiveRun(manifest);
+					applyRunVisualization(ctx, manifest, true);
+				}
 
-					let currentPlanPath = planStage.details.planPath;
-					let currentPlan = planStage.parsedPlan;
-					let currentExecution = await runExecutePlanStage({
+				try {
+					const result = await runDelegatedRole({
 						cwd: ctx.cwd,
-						planPath: currentPlanPath,
-						signal: controller.signal,
-						onUpdate: (message, details) => onUpdate?.({ content: [{ type: "text", text: message }], details }),
-					});
-					manifest = await updateRunManifest(ctx.cwd, manifest, { execution: currentExecution, stage: "review" });
-					await appendRunEvent(ctx.cwd, manifest, "execution_complete", `Executed ${currentExecution.packageCount} package(s).`, { packageCount: currentExecution.packageCount });
-
-					const maxReviewLoops = Math.min(MAX_REVIEW_LOOPS, Math.max(1, Math.floor(params.maxReviewLoops ?? MAX_REVIEW_LOOPS)));
-					let loopCount = 0;
-					let review = await runReviewStage({
-						cwd: ctx.cwd,
-						runId: manifest.runId,
-						planPath: currentPlanPath,
-						execution: currentExecution,
-						signal: controller.signal,
-						onUpdate: (message, details) => onUpdate?.({ content: [{ type: "text", text: message }], details }),
-					});
-					manifest = await updateRunManifest(ctx.cwd, manifest, { review: review.verdict, stage: "review", reviewLoops: loopCount });
-					await appendRunEvent(ctx.cwd, manifest, "review_complete", `Review verdict: ${review.verdict.verdict}`, {
-						verdict: review.verdict.verdict,
-						routingHint: review.verdict.routingHint,
-						needRescout: review.verdict.needRescout,
+						role: params.role as WorkerRole,
+						task: params.task,
+						feature: params.feature,
+						runId: params.runId,
+						label: params.label,
+						packageId: params.packageId,
+						signal,
+						onUpdate: (details) => {
+							upsertLiveSubagent({
+								runId: details.runId,
+								role: details.role as WorkerRole,
+								label: details.label,
+								packageId: details.packageId,
+								status: details.status,
+								model: details.model,
+								output: details.finalOutput,
+							});
+							refreshLiveSubagentOverlays();
+							onUpdate?.({ content: [{ type: "text", text: details.finalOutput || `(${details.role} running...)` }], details });
+						},
 					});
 
-					while (review.verdict.verdict === "fail" && loopCount < maxReviewLoops) {
-						loopCount += 1;
-						manifest = await updateRunManifest(ctx.cwd, manifest, { reviewLoops: loopCount, stage: "repair" });
-
-						if (review.verdict.needRescout) {
-							await appendRunEvent(ctx.cwd, manifest, "rescout_requested", `Reviewer requested a new scout pass on loop ${loopCount}.`);
-							const repairObjective = [params.objective, "Review feedback:", review.verdict.rawOutput].join("\n\n");
-							const replanned = await runPlanFeatureStage({
-								cwd: ctx.cwd,
-								feature: params.feature,
-								objective: repairObjective,
-								scoutMode: "run",
-								signal: controller.signal,
-								runId: manifest.runId,
-								onUpdate: (message, details) => onUpdate?.({ content: [{ type: "text", text: message }], details }),
-							});
-							currentPlanPath = replanned.details.planPath;
-							currentPlan = replanned.parsedPlan;
-							manifest = await updateRunManifest(ctx.cwd, manifest, { planPath: currentPlanPath, stage: "execution" });
-							await appendRunEvent(ctx.cwd, manifest, "plan_replaced", `Replanned to ${currentPlanPath}`, { planPath: currentPlanPath });
-							currentExecution = await runExecutePlanStage({
-								cwd: ctx.cwd,
-								planPath: currentPlanPath,
-								signal: controller.signal,
-								onUpdate: (message, details) => onUpdate?.({ content: [{ type: "text", text: message }], details }),
-							});
-						} else {
-							const reroutePackageIds = selectPackageIdsForRouting(currentPlan, review.verdict.routingHint);
-							await appendRunEvent(ctx.cwd, manifest, "repair_reroute", `Repair loop ${loopCount} rerouted to ${review.verdict.routingHint}.`, {
-								routingHint: review.verdict.routingHint,
-								packageIds: reroutePackageIds,
-							});
-							currentExecution = await runExecutePlanStage({
-								cwd: ctx.cwd,
-								planPath: currentPlanPath,
-								packageIds: reroutePackageIds,
-								signal: controller.signal,
-								onUpdate: (message, details) => onUpdate?.({ content: [{ type: "text", text: message }], details }),
-							});
-						}
-
-						manifest = await updateRunManifest(ctx.cwd, manifest, { execution: currentExecution, stage: "review" });
-						review = await runReviewStage({
-							cwd: ctx.cwd,
-							runId: manifest.runId,
-							planPath: currentPlanPath,
-							execution: currentExecution,
-							signal: controller.signal,
-							onUpdate: (message, details) => onUpdate?.({ content: [{ type: "text", text: message }], details }),
-						});
-						manifest = await updateRunManifest(ctx.cwd, manifest, { review: review.verdict, reviewLoops: loopCount });
-						await appendRunEvent(ctx.cwd, manifest, "review_complete", `Review verdict after loop ${loopCount}: ${review.verdict.verdict}`, {
-							verdict: review.verdict.verdict,
-							routingHint: review.verdict.routingHint,
-							needRescout: review.verdict.needRescout,
-						});
-					}
-
-					const finalStatus = review.verdict.verdict === "fail" ? "failed" : "completed";
-					manifest = await markRunFinished(ctx.cwd, manifest, finalStatus);
-					await appendRunEvent(ctx.cwd, manifest, "run_end", `Run finished with verdict ${review.verdict.verdict}.`);
-					await recordRoleExecution("orchestrator", ctx.cwd, {
-						task: `run_feature: ${params.feature}`,
-						status: review.verdict.verdict === "fail" ? "error" : "success",
-						output: `Run ${manifest.runId} finished with verdict ${review.verdict.verdict}.`,
-						metadata: { runId: manifest.runId, featureSlug, planPath: currentPlanPath, verdict: review.verdict.verdict },
-					});
-
-					const resultDetails: RunFeatureDetails = {
-						runId: manifest.runId,
-						featureSlug: currentExecution.featureSlug,
-						planPath: currentPlanPath,
-						reviewLoops: loopCount,
-						finalVerdict: review.verdict.verdict,
-						reportPath: getReviewReportPath(ctx.cwd, manifest.runId),
-						scoutUsed: manifest.scoutUsed,
-						packageCount: currentExecution.packageCount,
+					const details: DelegateToolDetails = {
+						...result.details,
+						label: params.label?.trim() || result.details.label,
+						packageId: params.packageId?.trim() || result.details.packageId,
+						runId: params.runId,
+						model: result.details.model || configuredRoleModel,
 					};
+					if (details.role === "engineer" || details.role === "designer") details.changedFiles = parseChangedFiles(details.finalOutput);
+					if (details.role === "reviewer") details.review = buildReviewSummary(details.finalOutput);
+					upsertLiveSubagent({
+						runId: details.runId,
+						role: details.role as WorkerRole,
+						label: details.label,
+						packageId: details.packageId,
+						status: details.status,
+						model: details.model,
+						output: details.finalOutput,
+					});
+					refreshLiveSubagentOverlays();
+					if (details.role === "scout" && params.runId) details.reportPath = getScoutReportPath(ctx.cwd, params.runId);
+					if (details.role === "reviewer" && params.runId) details.reportPath = getReviewReportPath(ctx.cwd, params.runId);
+					if (details.reportPath) await writeReport(details.reportPath, details.finalOutput || "");
+
+					if (manifest) {
+						upsertSubagentState(manifest, {
+							role: details.role,
+							label: details.label || details.role,
+							status: "completed",
+							packageId: details.packageId,
+							summary: summarizeText(details.finalOutput || "", 2),
+						});
+						manifest = await updateRunManifest(ctx.cwd, manifest, { subagents: manifest.subagents, scoutUsed: manifest.scoutUsed || details.role === "scout" });
+						manifest = await appendRunEvent(ctx.cwd, manifest, "delegate_complete", `${details.label || details.role} completed.`, {
+							role: details.role,
+							label: details.label,
+							packageId: details.packageId,
+							reportPath: details.reportPath,
+						});
+						setActiveRun(manifest);
+						applyRunVisualization(ctx, manifest, true);
+					}
 
 					return {
 						content: [{ type: "text", text: [
-							`Run ID: ${resultDetails.runId}`,
-							`Feature slug: ${resultDetails.featureSlug}`,
-							`Plan path: ${resultDetails.planPath}`,
-							`Review loops: ${resultDetails.reviewLoops}`,
-							`Final verdict: ${resultDetails.finalVerdict}`,
-							`Review report: ${resultDetails.reportPath}`,
-						].join("\n") }],
-						details: resultDetails,
+							`Role: ${details.role}`,
+							details.label ? `Label: ${details.label}` : undefined,
+							details.runId ? `Run: ${details.runId}` : undefined,
+							details.packageId ? `Package: ${details.packageId}` : undefined,
+							details.planPath ? `Plan: ${details.planPath}` : undefined,
+							details.reportPath ? `Report: ${details.reportPath}` : undefined,
+							details.changedFiles && details.changedFiles.length > 0 ? `Changed Files: ${details.changedFiles.join(", ")}` : undefined,
+							details.review ? `Review Verdict: ${details.review.verdict} / ${details.review.routingHint}` : undefined,
+							details.finalOutput || "(no output)",
+						].filter(Boolean).join("\n\n") }],
+						details,
 					};
 				} catch (error) {
-					if (activeRun) {
-						if (activeRun.status !== "stale") {
-							activeRun = await markRunFinished(ctx.cwd, activeRun, "failed");
-						}
-						await appendRunEvent(ctx.cwd, activeRun, "run_error", error instanceof Error ? error.message : String(error));
+					upsertLiveSubagent({
+						runId: params.runId,
+						role: params.role as WorkerRole,
+						label: params.label,
+						packageId: params.packageId,
+						status: "error",
+						model: configuredRoleModel,
+						output: error instanceof Error ? error.message : String(error),
+					});
+					refreshLiveSubagentOverlays();
+					if (manifest) {
+						upsertSubagentState(manifest, {
+							role: params.role as WorkerRole,
+							label: params.label?.trim() || params.packageId?.trim() || params.role,
+							status: "failed",
+							packageId: params.packageId?.trim() || undefined,
+							summary: error instanceof Error ? error.message : String(error),
+						});
+						manifest = await updateRunManifest(ctx.cwd, manifest, { subagents: manifest.subagents, scoutUsed: manifest.scoutUsed || params.role === "scout" });
+						manifest = await appendRunEvent(ctx.cwd, manifest, "delegate_error", `${params.label?.trim() || params.role} failed.`, {
+							role: params.role,
+							label: params.label,
+							packageId: params.packageId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+						setActiveRun(manifest);
+						applyRunVisualization(ctx, manifest, true);
 					}
 					throw error;
-				} finally {
-					clearActiveRun();
 				}
 			},
 			renderCall(args, theme) {
-				return new Text(`${theme.fg("toolTitle", theme.bold("run_feature "))}${theme.fg("accent", args.feature)}${theme.fg("dim", ` [${args.scoutMode ?? "auto"}]`)}`, 0, 0);
+				const label = args.label || args.packageId || args.role;
+				return new Text(`${theme.fg("toolTitle", theme.bold("Running "))}${theme.fg("accent", "[DELEGATE]")} ${theme.fg("toolOutput", label)}${theme.fg("dim", ` → ${args.role}`)}`, 0, 0);
 			},
-			renderResult(result, { expanded }, theme) {
-				const details = result.details as RunFeatureDetails | undefined;
+			renderResult(result, options, theme) {
+				const details = result.details as DelegateToolDetails | undefined;
 				if (!details) return new Text(result.content[0]?.type === "text" ? result.content[0].text : "(no output)", 0, 0);
-				const header = `${details.finalVerdict === "fail" ? theme.fg("error", "✗") : theme.fg("success", "✓")} ${theme.fg("toolTitle", theme.bold("run_feature"))}${theme.fg("dim", `  ${details.runId}`)}`;
-				if (!expanded) return new Text(`${header}\n${theme.fg("dim", `verdict:${details.finalVerdict} loops:${details.reviewLoops} packages:${details.packageCount}`)}`, 0, 0);
-				return new Markdown([header, `feature: ${details.featureSlug}`, `plan: ${details.planPath}`, `report: ${details.reportPath}`, `verdict: ${details.finalVerdict}`, `review loops: ${details.reviewLoops}`].join("\n"), 0, 0, getMarkdownTheme());
+				return renderDelegateResult(details, options.expanded, options.isPartial, theme);
 			},
 		});
 	}
