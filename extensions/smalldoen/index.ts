@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { complete, StringEnum } from "@mariozechner/pi-ai";
 import { BorderedLoader, getMarkdownTheme, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { getAgentConfig } from "./agents";
 import { findProjectRoot, getConfiguredModelSpec, getConfigPath, hasSmalldoenConfig } from "./config";
@@ -88,24 +88,6 @@ interface CommitsModelEntry {
 	spec?: string;
 	updatedAt: string;
 }
-
-interface LiveSubagentState {
-	key: string;
-	slot: number;
-	role: WorkerRole;
-	label: string;
-	packageId?: string;
-	runId?: string;
-	status: DelegateToolDetails["status"];
-	model?: string;
-	output: string;
-	updatedAt: string;
-}
-
-const liveSubagents = new Map<string, LiveSubagentState>();
-const liveSubagentOrder: string[] = [];
-let subagentWindowHandle: { hide(): void } | undefined;
-let subagentWindowPanel: SubagentWindowPanel | undefined;
 
 const ORCHESTRATOR_RUNTIME_PROMPT = `
 Orchestration mode is enabled for this session.
@@ -464,7 +446,6 @@ function setActiveRun(manifest: RunManifest | undefined): void {
 
 async function refreshRunVisualization(ctx: any): Promise<void> {
 	if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) {
-		resetLiveSubagents();
 		setActiveRun(undefined);
 		applyRunVisualization(ctx, undefined, false);
 		return;
@@ -475,7 +456,6 @@ async function refreshRunVisualization(ctx: any): Promise<void> {
 	}
 	const manifest = await loadRunManifest(ctx.cwd, activeRunId);
 	const activeManifest = manifest?.status === "active" ? manifest : undefined;
-	if (!activeManifest) resetLiveSubagents();
 	setActiveRun(activeManifest);
 	applyRunVisualization(ctx, activeManifest, true);
 }
@@ -507,53 +487,6 @@ function ensureConfigPresent(cwd: string): void {
 	throw new Error(buildMissingConfigGuidance(cwd).editorText);
 }
 
-function liveSubagentKey(input: { runId?: string; role: WorkerRole; packageId?: string; label?: string }): string {
-	return `${input.runId ?? "run"}:${input.role}:${input.packageId ?? input.label ?? input.role}`;
-}
-
-function resetLiveSubagents(): void {
-	subagentWindowHandle?.hide();
-	subagentWindowHandle = undefined;
-	subagentWindowPanel = undefined;
-	liveSubagents.clear();
-	liveSubagentOrder.splice(0, liveSubagentOrder.length);
-}
-
-function upsertLiveSubagent(input: {
-	runId?: string;
-	role: WorkerRole;
-	label?: string;
-	packageId?: string;
-	status: DelegateToolDetails["status"];
-	model?: string;
-	output?: string;
-}): LiveSubagentState {
-	const key = liveSubagentKey(input);
-	const existing = liveSubagents.get(key);
-	if (!existing) liveSubagentOrder.push(key);
-	const state: LiveSubagentState = {
-		key,
-		slot: existing?.slot ?? liveSubagentOrder.indexOf(key) + 1,
-		role: input.role,
-		label: input.label?.trim() || input.packageId?.trim() || input.role,
-		packageId: input.packageId?.trim() || existing?.packageId,
-		runId: input.runId ?? existing?.runId,
-		status: input.status,
-		model: input.model ?? existing?.model,
-		output: input.output ?? existing?.output ?? "",
-		updatedAt: new Date().toISOString(),
-	};
-	liveSubagents.set(key, state);
-	return state;
-}
-
-function refreshLiveSubagentOverlays(): void {
-	if (subagentWindowPanel) {
-		subagentWindowPanel.invalidate();
-		subagentWindowPanel.requestRender();
-	}
-}
-
 function effectiveStageLabel(manifest: RunManifest): string {
 	const roles = new Set(activeSubagents(manifest).map((subagent) => subagent.role));
 	if (roles.has("engineer") && !roles.has("designer") && roles.size === 1) return "ENGINEERING";
@@ -563,173 +496,6 @@ function effectiveStageLabel(manifest: RunManifest): string {
 	if (roles.has("planner") && roles.size === 1) return "PLANNING";
 	if (roles.has("reviewer") && roles.size === 1) return "REVIEWING";
 	return manifest.stage.toUpperCase();
-}
-
-class SubagentWindowPanel {
-	private selectedIndex = 0;
-	private cachedLines?: string[];
-	private cachedWidth?: number;
-
-	constructor(
-		private readonly tui: any,
-		private readonly theme: any,
-		private readonly getStates: () => LiveSubagentState[],
-		private readonly onClose: () => void,
-	) {}
-
-	requestRender(): void {
-		this.tui.requestRender();
-	}
-
-	handleInput(data: string): void {
-		const states = this.getStates();
-		if (matchesKey(data, Key.escape)) {
-			this.onClose();
-			return;
-		}
-		const maxIndex = Math.max(0, states.length - 1);
-		if (this.selectedIndex > maxIndex) this.selectedIndex = maxIndex;
-		if (matchesKey(data, Key.left) && this.selectedIndex > 0) {
-			this.selectedIndex--;
-			this.invalidate();
-			this.tui.requestRender();
-		} else if (matchesKey(data, Key.right) && this.selectedIndex < states.length - 1) {
-			this.selectedIndex++;
-			this.invalidate();
-			this.tui.requestRender();
-		}
-	}
-
-	invalidate(): void {
-		this.cachedLines = undefined;
-		this.cachedWidth = undefined;
-	}
-
-	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
-
-		const states = this.getStates();
-		if (states.length === 0) {
-			this.cachedLines = [this.theme.fg("dim", " No active subagents ")];
-			this.cachedWidth = width;
-			return this.cachedLines;
-		}
-
-		const idx = Math.min(this.selectedIndex, states.length - 1);
-		this.selectedIndex = idx;
-		const state = states[idx]!;
-		const innerWidth = Math.max(30, width - 2);
-		const pad = (line: string) => line + " ".repeat(Math.max(0, innerWidth - visibleWidth(line)));
-		const row = (line = "") => `${this.theme.fg("dim", "│")}${pad(line)}${this.theme.fg("dim", "│")}`;
-		const lines: string[] = [];
-		const statusColor = state.status === "running" ? "warning" : state.status === "success" ? "success" : "error";
-		lines.push(this.theme.fg("dim", `╭${"─".repeat(innerWidth)}╮`));
-
-		if (states.length > 1) {
-			const divider = this.theme.fg("dim", "│");
-			const labels = states.map((subagent, index) => {
-				const rawLabel = truncateToWidth(`${subagent.slot}:${subagent.label}`, 18, "…");
-				const label = ` ${rawLabel} `;
-				return index === idx
-					? this.theme.fg("accent", this.theme.bold(label))
-					: this.theme.fg("muted", label);
-			});
-			const joinTabs = (start: number, end: number) => {
-				const leftEllipsis = start > 0 ? `${this.theme.fg("dim", "…")}${divider}` : "";
-				const rightEllipsis = end < labels.length - 1 ? `${divider}${this.theme.fg("dim", "…")}` : "";
-				return `${leftEllipsis}${labels.slice(start, end + 1).join(divider)}${rightEllipsis}`;
-			};
-			let start = idx;
-			let end = idx;
-			let tabLine = joinTabs(start, end);
-			while (true) {
-				let expanded = false;
-				if (start > 0) {
-					const nextLine = joinTabs(start - 1, end);
-					if (visibleWidth(nextLine) <= innerWidth) {
-						start--;
-						tabLine = nextLine;
-						expanded = true;
-					}
-				}
-				if (end < labels.length - 1) {
-					const nextLine = joinTabs(start, end + 1);
-					if (visibleWidth(nextLine) <= innerWidth) {
-						end++;
-						tabLine = nextLine;
-						expanded = true;
-					}
-				}
-				if (!expanded) break;
-			}
-			lines.push(row(tabLine));
-			lines.push(row(this.theme.fg("dim", "─".repeat(innerWidth))));
-		}
-
-		lines.push(row(` ${this.theme.fg("accent", this.theme.bold(state.label))}  ${this.theme.fg("toolTitle", `→ ${state.role}`)}`));
-		lines.push(row(` ${this.theme.fg(statusColor, state.status.toUpperCase())}${state.model ? this.theme.fg("dim", `  ${state.model}`) : ""}`));
-		if (state.runId) lines.push(row(` ${this.theme.fg("dim", `run ${state.runId}`)}`));
-		lines.push(row(""));
-
-		const content = state.output?.trim() || "(waiting for subagent output...)";
-		for (const line of content.split("\n").slice(-20)) {
-			lines.push(row(` ${truncateToWidth(line, innerWidth - 2, "")}`));
-		}
-
-		const navHint = states.length > 1 ? "  ←/→ switch tab" : "";
-		lines.push(row(` ${this.theme.fg("dim", `esc close${navHint}`)}`));
-		lines.push(this.theme.fg("dim", `╰${"─".repeat(innerWidth)}╯`));
-
-		this.cachedLines = lines;
-		this.cachedWidth = width;
-		return lines;
-	}
-
-	dispose(): void {}
-}
-
-async function toggleSubagentWindow(ctx: any): Promise<void> {
-	if (subagentWindowHandle) {
-		subagentWindowHandle.hide();
-		subagentWindowHandle = undefined;
-		subagentWindowPanel = undefined;
-		return;
-	}
-	if (liveSubagents.size === 0) {
-		ctx.ui.notify("No active subagents.", "info");
-		return;
-	}
-	let panel: SubagentWindowPanel | undefined;
-	void ctx.ui
-		.custom(
-			(tui: any, theme: any, _keybindings: any, done: () => void) => {
-				panel = new SubagentWindowPanel(
-					tui,
-					theme,
-					() => liveSubagentOrder
-						.map((key) => liveSubagents.get(key))
-						.filter((state): state is LiveSubagentState => Boolean(state)),
-					done,
-				);
-				subagentWindowPanel = panel;
-				return panel;
-			},
-			{
-				overlay: true,
-				overlayOptions: {
-					anchor: "center",
-					width: "75%",
-					maxHeight: "70%",
-				},
-				onHandle: (handle: any) => {
-					subagentWindowHandle = handle;
-				},
-			},
-		)
-		.finally(() => {
-			subagentWindowHandle = undefined;
-			subagentWindowPanel = undefined;
-		});
 }
 
 async function writeReport(filePath: string, content: string): Promise<void> {
@@ -844,15 +610,10 @@ function formatManifestSummary(manifest: RunManifest): string {
 function renderDelegateResult(details: DelegateToolDetails, expanded: boolean, isPartial: boolean, theme: any) {
 	const status = isPartial ? "running" : details.status;
 	const statusColor = status === "success" ? "success" : status === "running" ? "warning" : status === "aborted" ? "muted" : "error";
-	const stateKey = isPartial
-		? liveSubagentKey({ runId: details.runId, role: details.role as WorkerRole, packageId: details.packageId, label: details.label })
-		: undefined;
-	const isLive = stateKey ? liveSubagents.has(stateKey) : false;
 	const metaBits = [
 		theme.fg(statusColor, statusIcon(status)),
 		details.model ? theme.fg("dim", details.model) : undefined,
 		details.runId ? theme.fg("dim", details.runId) : undefined,
-		isPartial && isLive ? theme.fg("dim", "Ctrl+Shift+I to view") : undefined,
 	].filter(Boolean).join("  ");
 	const preview = details.finalOutput ? summarizeText(details.finalOutput, 4) : "(running...)";
 	if (!expanded) return new Text(`${metaBits}\n${theme.fg("toolOutput", preview)}`, 0, 0);
@@ -961,7 +722,6 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		restoreCommitsModel(ctx);
 		syncTopLevelTools(pi);
 		if (modeState.enabled && !runtimeRole) await applyConfiguredOrchestratorModel(pi, ctx, modeState);
-		resetLiveSubagents();
 		setActiveRun(undefined);
 		await refreshRunVisualization(ctx);
 	});
@@ -972,7 +732,6 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		restoreCommitsModel(ctx);
 		syncTopLevelTools(pi);
 		if (modeState.enabled && !runtimeRole) await applyConfiguredOrchestratorModel(pi, ctx, modeState);
-		resetLiveSubagents();
 		setActiveRun(undefined);
 		await refreshRunVisualization(ctx);
 	});
@@ -996,7 +755,6 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		if (manifest && manifest.status === "active") {
 			const stale = await markRunStale(ctx.cwd, manifest, `Superseded by new user input: ${event.text.trim().slice(0, 200)}`);
 			await appendRunEvent(ctx.cwd, stale, "run_stale", "Run marked stale because a new user instruction interrupted the workflow.");
-			resetLiveSubagents();
 			setActiveRun(undefined);
 			applyRunVisualization(ctx, stale, true);
 		}
@@ -1035,10 +793,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 				const guidance = buildMissingConfigGuidance(ctx.cwd);
 				ctx.ui.notify(guidance.message, "warning");
 			}
-			if (!current && next) {
-				resetLiveSubagents();
-				setActiveRun(undefined);
-			}
+			if (!current && next) setActiveRun(undefined);
 			await refreshRunVisualization(ctx);
 		},
 	});
@@ -1222,15 +977,6 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	if (!runtimeRole) {
-		pi.registerShortcut("ctrl+shift+i", {
-			description: "Toggle smalldoen subagent window",
-			handler: async (ctx) => {
-				if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) return;
-				await toggleSubagentWindow(ctx);
-			},
-		});
-	}
 
 	const shouldRegisterDocsLookup = !runtimeRole || runtimeRole === "scout";
 	if (shouldRegisterDocsLookup) {
@@ -1283,7 +1029,6 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 							await markRunStale(ctx.cwd, current, "Superseded by a new orchestration run.");
 						}
 					}
-					resetLiveSubagents();
 					let manifest = await createRunManifest(ctx.cwd, {
 						feature: params.feature,
 						featureSlug: slugifyFeatureName(params.feature),
@@ -1376,7 +1121,6 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 					if (finalStatus === "stale") nextManifest = await markRunStale(ctx.cwd, manifest, params.note?.trim() || "Marked stale.");
 					else nextManifest = await markRunFinished(ctx.cwd, manifest, finalStatus);
 					nextManifest = await appendRunEvent(ctx.cwd, nextManifest, "run_end", params.note?.trim() || `Run finished with status ${finalStatus}.`);
-					if (finalStatus !== "stale") resetLiveSubagents();
 					setActiveRun(nextManifest.status === "active" ? nextManifest : undefined);
 					applyRunVisualization(ctx, nextManifest, true);
 					return { content: [{ type: "text", text: formatManifestSummary(nextManifest) }], details: buildManageRunDetails("finish", nextManifest) };
@@ -1457,16 +1201,6 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 				ensureConfigPresent(ctx.cwd);
 
 				const configuredRoleModel = getConfiguredModelSpec(ctx.cwd, params.role as WorkerRole);
-				upsertLiveSubagent({
-					runId: params.runId,
-					role: params.role as WorkerRole,
-					label: params.label,
-					packageId: params.packageId,
-					status: "running",
-					model: configuredRoleModel,
-					output: "",
-				});
-				refreshLiveSubagentOverlays();
 				onUpdate?.({
 					content: [{ type: "text", text: "(running...)" }],
 					details: {
@@ -1512,16 +1246,6 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 						packageId: params.packageId,
 						signal,
 						onUpdate: (details) => {
-							upsertLiveSubagent({
-								runId: details.runId,
-								role: details.role as WorkerRole,
-								label: details.label,
-								packageId: details.packageId,
-								status: details.status,
-								model: details.model,
-								output: details.finalOutput,
-							});
-							refreshLiveSubagentOverlays();
 							onUpdate?.({ content: [{ type: "text", text: details.finalOutput || `(${details.role} running...)` }], details });
 						},
 					});
@@ -1535,16 +1259,6 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 					};
 					if (details.role === "engineer" || details.role === "designer") details.changedFiles = parseChangedFiles(details.finalOutput);
 					if (details.role === "reviewer") details.review = buildReviewSummary(details.finalOutput);
-					upsertLiveSubagent({
-						runId: details.runId,
-						role: details.role as WorkerRole,
-						label: details.label,
-						packageId: details.packageId,
-						status: details.status,
-						model: details.model,
-						output: details.finalOutput,
-					});
-					refreshLiveSubagentOverlays();
 					if (details.role === "scout" && params.runId) details.reportPath = getScoutReportPath(ctx.cwd, params.runId);
 					if (details.role === "reviewer" && params.runId) details.reportPath = getReviewReportPath(ctx.cwd, params.runId);
 					if (details.reportPath) await writeReport(details.reportPath, details.finalOutput || "");
@@ -1583,16 +1297,6 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 						details,
 					};
 				} catch (error) {
-					upsertLiveSubagent({
-						runId: params.runId,
-						role: params.role as WorkerRole,
-						label: params.label,
-						packageId: params.packageId,
-						status: "error",
-						model: configuredRoleModel,
-						output: error instanceof Error ? error.message : String(error),
-					});
-					refreshLiveSubagentOverlays();
 					if (manifest) {
 						upsertSubagentState(manifest, {
 							role: params.role as WorkerRole,
