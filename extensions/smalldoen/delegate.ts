@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import { getAgentConfig } from "./agents";
 import { buildSubagentHookContent } from "./hooks";
 import { buildRoleMemoryContext, recordRoleExecution } from "./memory";
@@ -10,8 +11,9 @@ import {
 	validatePlanFile,
 	type ParsedPlan,
 } from "./plan";
-import { runChildAgent } from "./subprocess";
-import type { DelegateToolDetails } from "./types";
+import { getSubagentLogsDir } from "./paths";
+import { runChildAgent, type ChildLogCaptureOptions } from "./subprocess";
+import type { DelegateToolDetails, SubagentLogMode } from "./types";
 
 export const workerRoles = ["scout", "planner", "engineer", "designer", "reviewer"] as const;
 export type WorkerRole = (typeof workerRoles)[number];
@@ -26,6 +28,7 @@ export interface RunDelegatedRoleParams {
 	packageId?: string;
 	signal?: AbortSignal;
 	onUpdate?: (details: DelegateToolDetails) => void;
+	logMode?: SubagentLogMode;
 }
 
 export interface RunDelegatedRoleResult {
@@ -38,8 +41,95 @@ function createRunId(): string {
 	return `run-${timestamp}`;
 }
 
+function sanitizeLogSegment(value: string): string {
+	return value
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 48) || "subagent";
+}
+
+function buildLogFilePrefix(role: WorkerRole, label?: string, packageId?: string): string {
+	const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+	const identity = sanitizeLogSegment(packageId?.trim() || label?.trim() || role);
+	return `${timestamp}-${role}-${identity}`;
+}
+
+function buildLogCapture(
+	cwd: string,
+	role: WorkerRole,
+	mode: SubagentLogMode | undefined,
+	params: { runId?: string; label?: string; packageId?: string },
+): ChildLogCaptureOptions | undefined {
+	if (!mode || mode === "off") return undefined;
+	const prefix = buildLogFilePrefix(role, params.label, params.packageId);
+	const logsDir = getSubagentLogsDir(cwd, params.runId);
+	return {
+		mode,
+		paths: {
+			traceLogPath: path.join(logsDir, `${prefix}.trace.log`),
+			rawLogPath: mode === "full" ? path.join(logsDir, `${prefix}.jsonl`) : undefined,
+			stderrLogPath: mode === "full" ? path.join(logsDir, `${prefix}.stderr.log`) : undefined,
+		},
+	};
+}
+
+function buildDelegateDetails(
+	params: {
+		role: WorkerRole;
+		runId?: string;
+		label?: string;
+		packageId?: string;
+		featureSlug?: string;
+		planPath?: string;
+		model?: string;
+		logCapture?: ChildLogCaptureOptions;
+	},
+	state: {
+		status: DelegateToolDetails["status"];
+		exitCode: number;
+		finalOutput: string;
+		stderr?: string;
+		stopReason?: string;
+		errorMessage?: string;
+	},
+): DelegateToolDetails {
+	return {
+		role: params.role,
+		status: state.status,
+		runId: params.runId,
+		label: params.label,
+		packageId: params.packageId,
+		featureSlug: params.featureSlug,
+		planPath: params.planPath,
+		exitCode: state.exitCode,
+		stderr: state.stderr,
+		finalOutput: state.finalOutput,
+		model: params.model,
+		stopReason: state.stopReason,
+		errorMessage: state.errorMessage,
+		traceLogPath: params.logCapture?.paths.traceLogPath,
+		rawLogPath: params.logCapture?.paths.rawLogPath,
+		stderrLogPath: params.logCapture?.paths.stderrLogPath,
+	};
+}
+
+function formatLogPathLines(details: Pick<DelegateToolDetails, "traceLogPath" | "rawLogPath" | "stderrLogPath">): string[] {
+	return [
+		details.traceLogPath ? `Trace Log: ${details.traceLogPath}` : undefined,
+		details.rawLogPath ? `Raw Log: ${details.rawLogPath}` : undefined,
+		details.stderrLogPath ? `Stderr Log: ${details.stderrLogPath}` : undefined,
+	].filter((line): line is string => Boolean(line));
+}
+
+function createDelegatedRoleError(message: string, details: DelegateToolDetails): Error {
+	const error = new Error([message.trim(), ...formatLogPathLines(details)].filter(Boolean).join("\n"));
+	(error as Error & { details?: DelegateToolDetails }).details = details;
+	return error;
+}
+
 export async function runDelegatedRole(params: RunDelegatedRoleParams): Promise<RunDelegatedRoleResult> {
-	const { cwd, role, task, feature, runId, label, packageId, signal, onUpdate } = params;
+	const { cwd, role, task, feature, runId, label, packageId, signal, onUpdate, logMode } = params;
 	const agent = getAgentConfig(cwd, role);
 	if (!agent) throw new Error(`Missing agent definition for role: ${role}`);
 
@@ -77,6 +167,13 @@ export async function runDelegatedRole(params: RunDelegatedRoleParams): Promise<
 			: `Project-local hook:\n${hookContent}`;
 	}
 
+	const logCapture = buildLogCapture(cwd, role, logMode, { runId, label, packageId });
+	const runningDetails = buildDelegateDetails(
+		{ role, runId, label, packageId, featureSlug, planPath, model: configuredModel, logCapture },
+		{ status: "running", exitCode: 0, finalOutput: "" },
+	);
+	onUpdate?.(runningDetails);
+
 	const childResult = await runChildAgent({
 		cwd,
 		role,
@@ -84,63 +181,62 @@ export async function runDelegatedRole(params: RunDelegatedRoleParams): Promise<
 		agent,
 		appendPrompt,
 		signal,
+		logging: logCapture,
 		onUpdate: (text) => {
-			onUpdate?.({
-				role,
-				status: "running",
-				runId,
-				label,
-				packageId,
-				featureSlug,
-				planPath,
-				exitCode: 0,
-				finalOutput: text || "",
-				model: configuredModel,
-			});
+			onUpdate?.(buildDelegateDetails(
+				{ role, runId, label, packageId, featureSlug, planPath, model: configuredModel, logCapture },
+				{ status: "running", exitCode: 0, finalOutput: text || "" },
+			));
 		},
 	});
 
 	let parsedPlan: ParsedPlan | undefined;
+	let runtimeError: string | undefined;
 	if (role === "planner" && planPath) {
 		const planMarkdown = await readPlanFile(planPath);
-		if (!planMarkdown) throw new Error(`Planner did not create the required plan file: ${planPath}`);
-		const validationError = validatePlanFile(planMarkdown);
-		if (validationError) throw new Error(`Planner created an invalid plan file at ${planPath}: ${validationError}`);
-		parsedPlan = parsePlanFile(planPath, planMarkdown);
+		if (!planMarkdown) runtimeError = `Planner did not create the required plan file: ${planPath}`;
+		else {
+			const validationError = validatePlanFile(planMarkdown);
+			if (validationError) runtimeError = `Planner created an invalid plan file at ${planPath}: ${validationError}`;
+			else parsedPlan = parsePlanFile(planPath, planMarkdown);
+		}
 	}
 
-	const details: DelegateToolDetails = {
-		role,
-		status: childResult.stopReason === "aborted" ? "aborted" : childResult.exitCode === 0 ? "success" : "error",
-		runId,
-		label,
-		packageId,
-		featureSlug,
-		planPath,
-		exitCode: childResult.exitCode,
-		stderr: childResult.stderr || undefined,
-		finalOutput: childResult.finalOutput,
-		model: childResult.model || configuredModel,
-		stopReason: childResult.stopReason,
-		errorMessage: childResult.errorMessage,
-	};
+	const childFailed = childResult.exitCode !== 0 || childResult.stopReason === "error" || childResult.stopReason === "aborted";
+	const details = buildDelegateDetails(
+		{ role, runId, label, packageId, featureSlug, planPath, model: childResult.model || configuredModel, logCapture },
+		{
+			status: childResult.stopReason === "aborted" ? "aborted" : runtimeError || childFailed ? "error" : "success",
+			exitCode: childResult.exitCode,
+			stderr: childResult.stderr || undefined,
+			finalOutput: childResult.finalOutput,
+			stopReason: childResult.stopReason,
+			errorMessage: runtimeError || childResult.errorMessage,
+		},
+	);
 
-	const isError = childResult.exitCode !== 0 || childResult.stopReason === "error" || childResult.stopReason === "aborted";
 	await recordRoleExecution(role, cwd, {
 		task,
-		status: isError ? "error" : "success",
-		output: childResult.finalOutput || childResult.stderr || "(no output)",
+		status: runtimeError || childFailed ? "error" : "success",
+		output: runtimeError || childResult.finalOutput || childResult.stderr || "(no output)",
 		metadata: {
 			sourceRunId,
 			featureSlug,
 			planPath,
 			model: childResult.model || configuredModel,
 			stopReason: childResult.stopReason,
+			traceLogPath: details.traceLogPath,
+			rawLogPath: details.rawLogPath,
+			stderrLogPath: details.stderrLogPath,
 		},
 	});
 
-	if (isError) {
-		throw new Error(childResult.errorMessage || childResult.stderr || childResult.finalOutput || `Delegated role failed: ${role}`);
+	if (runtimeError) throw createDelegatedRoleError(runtimeError, details);
+	if (childFailed) {
+		throw createDelegatedRoleError(
+			childResult.errorMessage || childResult.stderr || childResult.finalOutput || `Delegated role failed: ${role}`,
+			details,
+		);
 	}
 
 	return { details, parsedPlan };

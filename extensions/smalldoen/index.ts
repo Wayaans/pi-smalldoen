@@ -6,7 +6,7 @@ import { BorderedLoader, getMarkdownTheme, type ExtensionAPI } from "@mariozechn
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { getAgentConfig } from "./agents";
-import { findProjectRoot, getConfiguredModelSpec, getConfigPath, hasSmalldoenConfig } from "./config";
+import { findProjectRoot, getConfiguredModelSpec, getConfiguredSubagentLogMode, getConfigPath, hasSmalldoenConfig } from "./config";
 import { buildDocsContext, fetchUrl, searchDocs } from "./docs";
 import { runDelegatedRole, workerRoles, type WorkerRole } from "./delegate";
 import {
@@ -35,6 +35,7 @@ import {
 	ensureRuntimeLayout,
 	getReviewReportPath,
 	getScoutReportPath,
+	getSmalldoenPaths,
 } from "./paths";
 import { parseChangedFiles, parseReviewOutput } from "./reviewer";
 import {
@@ -60,6 +61,7 @@ import {
 	type OrchestrationModeState,
 	type PlanInspectionDetails,
 	type ReviewSummary,
+	type SubagentLogMode,
 } from "./types";
 
 const DOCS_LOOKUP_TOOL_NAME = "docs_lookup" as const;
@@ -72,8 +74,10 @@ const runtimeRole = getRuntimeRole();
 
 let activeRunId: string | undefined;
 let commitsModelSpec: string | undefined;
+let subagentLogsOverride: SubagentLogMode | undefined;
 
 const SMALLDOEN_COMMITS_MODEL_ENTRY = "smalldoen-commits-model" as const;
+const SMALLDOEN_SUBAGENT_LOGS_ENTRY = "smalldoen-subagent-logs" as const;
 const COMMITS_SYSTEM_PROMPT = `You write concise, high-signal git commit messages.
 
 Rules:
@@ -86,6 +90,11 @@ Rules:
 
 interface CommitsModelEntry {
 	spec?: string;
+	updatedAt: string;
+}
+
+interface SubagentLogsEntry {
+	mode?: SubagentLogMode;
 	updatedAt: string;
 }
 
@@ -215,6 +224,14 @@ function compactPath(cwd: string, filePath?: string, segmentCount = 3): string |
 	return parts.length <= segmentCount ? relative : `…/${parts.slice(-segmentCount).join("/")}`;
 }
 
+function formatDelegateLogMeta(details: Pick<DelegateToolDetails, "traceLogPath" | "rawLogPath" | "stderrLogPath">, cwd?: string): string[] {
+	return [
+		details.traceLogPath ? `trace ${cwd ? compactPath(cwd, details.traceLogPath, 4) : details.traceLogPath}` : undefined,
+		details.rawLogPath ? `raw ${cwd ? compactPath(cwd, details.rawLogPath, 4) : details.rawLogPath}` : undefined,
+		details.stderrLogPath ? `stderr ${cwd ? compactPath(cwd, details.stderrLogPath, 4) : details.stderrLogPath}` : undefined,
+	].filter((line): line is string => Boolean(line));
+}
+
 function restoreCommitsModel(ctx: any): void {
 	commitsModelSpec = undefined;
 	for (const entry of ctx.sessionManager.getBranch() as Array<any>) {
@@ -232,6 +249,51 @@ function persistCommitsModel(pi: ExtensionAPI, spec?: string): string | undefine
 		updatedAt: new Date().toISOString(),
 	});
 	return normalized;
+}
+
+function restoreSubagentLogsMode(ctx: any): void {
+	subagentLogsOverride = undefined;
+	for (const entry of ctx.sessionManager.getBranch() as Array<any>) {
+		if (entry.type !== "custom" || entry.customType !== SMALLDOEN_SUBAGENT_LOGS_ENTRY) continue;
+		const mode = (entry.data as SubagentLogsEntry | undefined)?.mode;
+		subagentLogsOverride = mode === "off" || mode === "trace" || mode === "full" ? mode : undefined;
+	}
+}
+
+function persistSubagentLogsMode(pi: ExtensionAPI, mode?: SubagentLogMode): SubagentLogMode | undefined {
+	const normalized = mode === "off" || mode === "trace" || mode === "full" ? mode : undefined;
+	subagentLogsOverride = normalized;
+	pi.appendEntry(SMALLDOEN_SUBAGENT_LOGS_ENTRY, {
+		mode: normalized,
+		updatedAt: new Date().toISOString(),
+	});
+	return normalized;
+}
+
+function getEffectiveSubagentLogsMode(cwd: string): SubagentLogMode {
+	return subagentLogsOverride ?? getConfiguredSubagentLogMode(cwd);
+}
+
+function enableSubagentLogsForSession(pi: ExtensionAPI, cwd: string): { effective: SubagentLogMode; source: "config" | "session" } {
+	const configured = getConfiguredSubagentLogMode(cwd);
+	if (configured !== "off") {
+		persistSubagentLogsMode(pi, undefined);
+		return { effective: configured, source: "config" };
+	}
+	persistSubagentLogsMode(pi, "trace");
+	return { effective: "trace", source: "session" };
+}
+
+function describeSubagentLogsStatus(cwd: string): string {
+	const configured = getConfiguredSubagentLogMode(cwd);
+	const effective = getEffectiveSubagentLogsMode(cwd);
+	const source = subagentLogsOverride ? "session override" : "config default";
+	const logsDir = getSmalldoenPaths(cwd).logsDir;
+	return [
+		`Subagent logs: ${effective.toUpperCase()} (${source})`,
+		`Configured default: ${configured.toUpperCase()}`,
+		`Logs directory: ${logsDir}`,
+	].join("\n");
 }
 
 function formatModelSpec(model: { provider: string; id: string }): string {
@@ -598,6 +660,7 @@ function formatManifestSummary(manifest: RunManifest): string {
 		lines.push("", "Recent Subagents:");
 		for (const subagent of manifest.subagents.slice(0, 8)) {
 			lines.push(`- [${subagent.updatedAt}] ${subagent.role} ${subagent.label} -> ${subagent.status}`);
+			for (const logLine of formatDelegateLogMeta(subagent)) lines.push(`  ${logLine}`);
 		}
 	}
 	if (manifest.events.length > 0) {
@@ -621,6 +684,7 @@ function renderDelegateResult(details: DelegateToolDetails, expanded: boolean, i
 	const container = new Container();
 	container.addChild(new Text(metaBits, 0, 0));
 	if (details.reportPath) container.addChild(new Text(theme.fg("dim", `report ${details.reportPath}`), 0, 0));
+	for (const logLine of formatDelegateLogMeta(details)) container.addChild(new Text(theme.fg("dim", logLine), 0, 0));
 	if (details.changedFiles && details.changedFiles.length > 0) container.addChild(new Text(theme.fg("muted", `files ${details.changedFiles.join(", ")}`), 0, 0));
 	if (details.review) container.addChild(new Text(theme.fg("muted", `review ${details.review.verdict} / ${details.review.routingHint}`), 0, 0));
 	if (details.stderr) container.addChild(new Text(theme.fg("warning", details.stderr.trim()), 0, 0));
@@ -720,6 +784,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		await ensureRuntimeLayout(ctx.cwd);
 		restoreOrchestrationMode(ctx, modeState);
 		restoreCommitsModel(ctx);
+		restoreSubagentLogsMode(ctx);
 		syncTopLevelTools(pi);
 		if (modeState.enabled && !runtimeRole) await applyConfiguredOrchestratorModel(pi, ctx, modeState);
 		setActiveRun(undefined);
@@ -730,6 +795,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		await ensureRuntimeLayout(ctx.cwd);
 		restoreOrchestrationMode(ctx, modeState);
 		restoreCommitsModel(ctx);
+		restoreSubagentLogsMode(ctx);
 		syncTopLevelTools(pi);
 		if (modeState.enabled && !runtimeRole) await applyConfiguredOrchestratorModel(pi, ctx, modeState);
 		setActiveRun(undefined);
@@ -740,7 +806,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) return { action: "continue" as const };
 		const text = event.text.trim();
 		if (!text) return { action: "continue" as const };
-		const allowedWithoutConfig = ["/orch", "/reload", "/smalldoen-status"];
+		const allowedWithoutConfig = ["/orch", "/reload", "/smalldoen-status", "/subagent-logs"];
 		if (!hasSmalldoenConfig(ctx.cwd)) {
 			if (!allowedWithoutConfig.some((command) => text === command || text.startsWith(`${command} `))) {
 				const guidance = buildMissingConfigGuidance(ctx.cwd);
@@ -809,6 +875,33 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			ctx.ui.setEditorText(formatManifestSummary(manifest));
 			applyRunVisualization(ctx, manifest, modeState.enabled);
 			ctx.ui.notify(`Loaded status for ${manifest.runId}`, "info");
+		},
+	});
+
+	pi.registerCommand("subagent-logs", {
+		description: "Control delegated subagent log capture (/subagent-logs on|off|trace|full|status)",
+		handler: async (args, ctx) => {
+			const command = (args || "").trim().toLowerCase();
+			if (!["on", "off", "trace", "full", "status"].includes(command)) {
+				ctx.ui.notify("Usage: /subagent-logs on, /subagent-logs off, /subagent-logs trace, /subagent-logs full, /subagent-logs status", "warning");
+				return;
+			}
+			if (command === "status") {
+				ctx.ui.notify(describeSubagentLogsStatus(ctx.cwd), "info");
+				return;
+			}
+			if (command === "on") {
+				const enabled = enableSubagentLogsForSession(pi, ctx.cwd);
+				ctx.ui.notify(
+					enabled.source === "config"
+						? `Subagent logs enabled with config default: ${enabled.effective.toUpperCase()}`
+						: `Subagent logs enabled for this session: ${enabled.effective.toUpperCase()}`,
+					"info",
+				);
+				return;
+			}
+			persistSubagentLogsMode(pi, command as SubagentLogMode);
+			ctx.ui.notify(`Subagent logs set to ${command.toUpperCase()} for this session.`, "info");
 		},
 	});
 
@@ -1201,6 +1294,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 				ensureConfigPresent(ctx.cwd);
 
 				const configuredRoleModel = getConfiguredModelSpec(ctx.cwd, params.role as WorkerRole);
+				const subagentLogMode = getEffectiveSubagentLogsMode(ctx.cwd);
 				onUpdate?.({
 					content: [{ type: "text", text: "(running...)" }],
 					details: {
@@ -1245,6 +1339,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 						label: params.label,
 						packageId: params.packageId,
 						signal,
+						logMode: subagentLogMode,
 						onUpdate: (details) => {
 							onUpdate?.({ content: [{ type: "text", text: details.finalOutput || `(${details.role} running...)` }], details });
 						},
@@ -1270,6 +1365,9 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 							status: "completed",
 							packageId: details.packageId,
 							summary: summarizeText(details.finalOutput || "", 2),
+							traceLogPath: details.traceLogPath,
+							rawLogPath: details.rawLogPath,
+							stderrLogPath: details.stderrLogPath,
 						});
 						manifest = await updateRunManifest(ctx.cwd, manifest, { subagents: manifest.subagents, scoutUsed: manifest.scoutUsed || details.role === "scout" });
 						manifest = await appendRunEvent(ctx.cwd, manifest, "delegate_complete", `${details.label || details.role} completed.`, {
@@ -1290,6 +1388,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 							details.packageId ? `Package: ${details.packageId}` : undefined,
 							details.planPath ? `Plan: ${details.planPath}` : undefined,
 							details.reportPath ? `Report: ${details.reportPath}` : undefined,
+							...formatDelegateLogMeta(details, ctx.cwd),
 							details.changedFiles && details.changedFiles.length > 0 ? `Changed Files: ${details.changedFiles.join(", ")}` : undefined,
 							details.review ? `Review Verdict: ${details.review.verdict} / ${details.review.routingHint}` : undefined,
 							details.finalOutput || "(no output)",
@@ -1297,6 +1396,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 						details,
 					};
 				} catch (error) {
+					const errorDetails = error && typeof error === "object" ? (error as { details?: DelegateToolDetails }).details : undefined;
 					if (manifest) {
 						upsertSubagentState(manifest, {
 							role: params.role as WorkerRole,
@@ -1304,6 +1404,9 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 							status: "failed",
 							packageId: params.packageId?.trim() || undefined,
 							summary: error instanceof Error ? error.message : String(error),
+							traceLogPath: errorDetails?.traceLogPath,
+							rawLogPath: errorDetails?.rawLogPath,
+							stderrLogPath: errorDetails?.stderrLogPath,
 						});
 						manifest = await updateRunManifest(ctx.cwd, manifest, { subagents: manifest.subagents, scoutUsed: manifest.scoutUsed || params.role === "scout" });
 						manifest = await appendRunEvent(ctx.cwd, manifest, "delegate_error", `${params.label?.trim() || params.role} failed.`, {

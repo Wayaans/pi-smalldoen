@@ -3,6 +3,9 @@ export const SMALLDOEN_STATUS_KEY = "smalldoen-status" as const;
 export const DELEGATE_TOOL_NAME = "delegate" as const;
 
 export const AGENT_ROLES = ["orchestrator", "scout", "planner", "engineer", "designer", "reviewer"] as const;
+export const SUBAGENT_LOG_MODES = ["off", "trace", "full"] as const;
+
+export type SubagentLogMode = (typeof SUBAGENT_LOG_MODES)[number];
 
 export type AgentRole = (typeof AGENT_ROLES)[number];
 
@@ -38,6 +41,9 @@ export interface DelegateToolDetails {
 	model?: string;
 	stopReason?: string;
 	errorMessage?: string;
+	traceLogPath?: string;
+	rawLogPath?: string;
+	stderrLogPath?: string;
 	changedFiles?: string[];
 	review?: ReviewSummary;
 }

@@ -4,8 +4,19 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@mariozechner/pi-ai";
-import type { AgentRole } from "./types";
+import type { AgentRole, SubagentLogMode } from "./types";
 import type { AgentConfig } from "./agents";
+
+export interface ChildAgentLogPaths {
+	traceLogPath?: string;
+	rawLogPath?: string;
+	stderrLogPath?: string;
+}
+
+export interface ChildLogCaptureOptions {
+	mode: Exclude<SubagentLogMode, "off">;
+	paths: ChildAgentLogPaths;
+}
 
 export interface ChildInvocationOptions {
 	cwd: string;
@@ -15,6 +26,7 @@ export interface ChildInvocationOptions {
 	appendPrompt?: string;
 	onUpdate?: (text: string) => void;
 	signal?: AbortSignal;
+	logging?: ChildLogCaptureOptions;
 }
 
 export interface ChildAgentResult {
@@ -26,6 +38,7 @@ export interface ChildAgentResult {
 	stopReason?: string;
 	errorMessage?: string;
 	model?: string;
+	logPaths?: ChildAgentLogPaths;
 }
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
@@ -108,6 +121,13 @@ interface ChildLiveTrace {
 	lastAssistant: string;
 }
 
+interface ChildLogWriters {
+	paths: ChildAgentLogPaths;
+	trace?: syncFs.WriteStream;
+	raw?: syncFs.WriteStream;
+	stderr?: syncFs.WriteStream;
+}
+
 function pushRecentEvent(trace: ChildLiveTrace, text: string): void {
 	if (!text.trim()) return;
 	trace.recentEvents.push(text.trim());
@@ -150,6 +170,35 @@ function renderLiveTrace(trace: ChildLiveTrace): string {
 	return sections.join("\n\n").trim();
 }
 
+function logTraceLine(logWriters: ChildLogWriters | undefined, text: string): void {
+	if (!logWriters?.trace || !text.trim()) return;
+	logWriters.trace.write(`[${new Date().toISOString()}] ${text.trim()}\n`);
+}
+
+function endStream(stream?: syncFs.WriteStream): Promise<void> {
+	return new Promise((resolve) => {
+		if (!stream) return resolve();
+		stream.on("finish", resolve);
+		stream.on("error", () => resolve());
+		stream.end();
+	});
+}
+
+async function createChildLogWriters(logging?: ChildLogCaptureOptions): Promise<ChildLogWriters | undefined> {
+	if (!logging) return undefined;
+	const directories = new Set<string>();
+	for (const filePath of [logging.paths.traceLogPath, logging.paths.rawLogPath, logging.paths.stderrLogPath]) {
+		if (filePath) directories.add(path.dirname(filePath));
+	}
+	await Promise.all(Array.from(directories).map((dir) => fs.mkdir(dir, { recursive: true })));
+	return {
+		paths: logging.paths,
+		trace: logging.paths.traceLogPath ? syncFs.createWriteStream(logging.paths.traceLogPath, { flags: "w", encoding: "utf8", mode: 0o600 }) : undefined,
+		raw: logging.paths.rawLogPath ? syncFs.createWriteStream(logging.paths.rawLogPath, { flags: "w", encoding: "utf8", mode: 0o600 }) : undefined,
+		stderr: logging.paths.stderrLogPath ? syncFs.createWriteStream(logging.paths.stderrLogPath, { flags: "w", encoding: "utf8", mode: 0o600 }) : undefined,
+	};
+}
+
 async function writeTempPrompt(role: AgentRole, content: string): Promise<{ dir: string; filePath: string }> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), `smalldoen-${role}-`));
 	const filePath = path.join(dir, `${role}.md`);
@@ -158,7 +207,7 @@ async function writeTempPrompt(role: AgentRole, content: string): Promise<{ dir:
 }
 
 export async function runChildAgent(options: ChildInvocationOptions): Promise<ChildAgentResult> {
-	const { cwd, role, task, agent, appendPrompt, onUpdate, signal } = options;
+	const { cwd, role, task, agent, appendPrompt, onUpdate, signal, logging } = options;
 	const messages: Message[] = [];
 	const args = ["--mode", "json", "-p", "--no-session"];
 	if (agent.provider && agent.model) args.push("--model", `${agent.provider}/${agent.model}`);
@@ -167,6 +216,7 @@ export async function runChildAgent(options: ChildInvocationOptions): Promise<Ch
 
 	let tempPromptDir: string | undefined;
 	let tempPromptPath: string | undefined;
+	let logWriters: ChildLogWriters | undefined;
 
 	try {
 		const promptParts = [agent.systemPrompt.trim(), appendPrompt?.trim()].filter(Boolean);
@@ -178,6 +228,9 @@ export async function runChildAgent(options: ChildInvocationOptions): Promise<Ch
 		}
 
 		args.push(task);
+		logWriters = await createChildLogWriters(logging);
+		logTraceLine(logWriters, `subagent started (${role})`);
+		logTraceLine(logWriters, `task: ${truncate(task.replace(/\s+/g, " ").trim(), 240)}`);
 
 		const invocation = getPiInvocation(args);
 		let stderr = "";
@@ -202,7 +255,25 @@ export async function runChildAgent(options: ChildInvocationOptions): Promise<Ch
 				assistantStreaming: "",
 				lastAssistant: "",
 			};
+			const toolUpdateSummaries = new Map<string, string>();
+			let assistantTraceOpen = false;
+			let assistantTraceNeedsNewline = false;
 			let lastRenderedTrace = "";
+
+			const openAssistantTrace = () => {
+				if (assistantTraceOpen || !logWriters?.trace) return;
+				logWriters.trace.write(`[${new Date().toISOString()}] assistant>\n`);
+				assistantTraceOpen = true;
+				assistantTraceNeedsNewline = false;
+			};
+
+			const closeAssistantTrace = () => {
+				if (!assistantTraceOpen || !logWriters?.trace) return;
+				if (assistantTraceNeedsNewline) logWriters.trace.write("\n");
+				assistantTraceOpen = false;
+				assistantTraceNeedsNewline = false;
+			};
+
 			const emitTrace = () => {
 				const nextTrace = renderLiveTrace(trace);
 				if (!nextTrace || nextTrace === lastRenderedTrace) return;
@@ -221,12 +292,14 @@ export async function runChildAgent(options: ChildInvocationOptions): Promise<Ch
 
 				if (event.type === "turn_start") {
 					pushRecentEvent(trace, "turn started");
+					logTraceLine(logWriters, "turn started");
 					emitTrace();
 					return;
 				}
 
 				if (event.type === "message_start" && event.message?.role === "assistant") {
 					trace.assistantStreaming = "";
+					logTraceLine(logWriters, "assistant started");
 					emitTrace();
 					return;
 				}
@@ -234,6 +307,11 @@ export async function runChildAgent(options: ChildInvocationOptions): Promise<Ch
 				if (event.type === "message_update" && event.message?.role === "assistant") {
 					if (event.assistantMessageEvent?.type === "text_delta" && typeof event.assistantMessageEvent.delta === "string") {
 						trace.assistantStreaming += event.assistantMessageEvent.delta;
+						if (logWriters?.trace) {
+							openAssistantTrace();
+							logWriters.trace.write(event.assistantMessageEvent.delta);
+							assistantTraceNeedsNewline = !event.assistantMessageEvent.delta.endsWith("\n");
+						}
 					} else {
 						trace.assistantStreaming = getMessageText(event.message as Message) || trace.assistantStreaming;
 					}
@@ -249,13 +327,21 @@ export async function runChildAgent(options: ChildInvocationOptions): Promise<Ch
 					});
 					if (!trace.activeToolOrder.includes(event.toolCallId)) trace.activeToolOrder.push(event.toolCallId);
 					pushRecentEvent(trace, `${event.toolName} started${stringifyToolArgs(event.args) ? `: ${stringifyToolArgs(event.args)}` : ""}`);
+					toolUpdateSummaries.delete(event.toolCallId);
+					logTraceLine(logWriters, `${event.toolName} started${stringifyToolArgs(event.args) ? `: ${stringifyToolArgs(event.args)}` : ""}`);
 					emitTrace();
 					return;
 				}
 
 				if (event.type === "tool_execution_update") {
 					const tool = trace.activeTools.get(event.toolCallId);
-					if (tool) tool.output = getToolResultText(event.partialResult);
+					const output = getToolResultText(event.partialResult);
+					if (tool) tool.output = output;
+					const summary = summarizeToolResultText(output);
+					if (summary && toolUpdateSummaries.get(event.toolCallId) !== summary) {
+						toolUpdateSummaries.set(event.toolCallId, summary);
+						logTraceLine(logWriters, `${event.toolName} update: ${summary}`);
+					}
 					emitTrace();
 					return;
 				}
@@ -273,7 +359,13 @@ export async function runChildAgent(options: ChildInvocationOptions): Promise<Ch
 						trace.activeToolOrder = trace.activeToolOrder.filter((id) => id !== event.toolCallId);
 					}
 					const resultSummary = summarizeToolResultText(resultText || tool?.output || "");
+					toolUpdateSummaries.delete(event.toolCallId);
+					logTraceLine(
+						logWriters,
+						`${event.toolName} ${event.isError ? "failed" : "finished"}${stringifyToolArgs(event.args) ? `: ${stringifyToolArgs(event.args)}` : ""}`,
+					);
 					if (resultSummary) pushRecentEvent(trace, `${event.toolName} output: ${resultSummary}`);
+					if (resultSummary) logTraceLine(logWriters, `${event.toolName} output: ${resultSummary}`);
 					emitTrace();
 					return;
 				}
@@ -285,9 +377,19 @@ export async function runChildAgent(options: ChildInvocationOptions): Promise<Ch
 						stopReason = message.stopReason;
 						errorMessage = message.errorMessage;
 						model = message.model;
-						trace.lastAssistant = getMessageText(message) || trace.lastAssistant;
+						const messageText = getMessageText(message);
+						trace.lastAssistant = messageText || trace.lastAssistant;
 						trace.assistantStreaming = "";
+						if (!assistantTraceOpen && messageText) {
+							openAssistantTrace();
+							if (logWriters?.trace) {
+								logWriters.trace.write(messageText);
+								assistantTraceNeedsNewline = !messageText.endsWith("\n");
+							}
+						}
+						closeAssistantTrace();
 						pushRecentEvent(trace, "assistant finished");
+						logTraceLine(logWriters, `assistant finished${message.stopReason ? ` (${message.stopReason})` : ""}`);
 						emitTrace();
 					}
 					return;
@@ -295,23 +397,29 @@ export async function runChildAgent(options: ChildInvocationOptions): Promise<Ch
 
 				if (event.type === "turn_end") {
 					pushRecentEvent(trace, "turn finished");
+					logTraceLine(logWriters, "turn finished");
 					emitTrace();
 				}
 			};
 
 			child.stdout.on("data", (chunk) => {
-				buffer += chunk.toString();
+				const text = chunk.toString();
+				logWriters?.raw?.write(text);
+				buffer += text;
 				const lines = buffer.split("\n");
 				buffer = lines.pop() || "";
 				for (const line of lines) processLine(line);
 			});
 
 			child.stderr.on("data", (chunk) => {
-				stderr += chunk.toString();
+				const text = chunk.toString();
+				stderr += text;
+				logWriters?.stderr?.write(text);
 			});
 
 			child.on("close", (code) => {
 				if (buffer.trim()) processLine(buffer);
+				closeAssistantTrace();
 				resolve(code ?? 0);
 			});
 
@@ -329,6 +437,8 @@ export async function runChildAgent(options: ChildInvocationOptions): Promise<Ch
 		});
 
 		if (wasAborted) throw new Error("Child agent aborted");
+		logTraceLine(logWriters, `subagent finished with exit code ${exitCode}`);
+		if (stderr.trim()) logTraceLine(logWriters, `stderr captured (${stderr.trim().split(/\r?\n/).length} line${stderr.trim().split(/\r?\n/).length === 1 ? "" : "s"})`);
 
 		return {
 			role,
@@ -339,8 +449,10 @@ export async function runChildAgent(options: ChildInvocationOptions): Promise<Ch
 			stopReason,
 			errorMessage,
 			model,
+			logPaths: logWriters?.paths,
 		};
 	} finally {
+		await Promise.all([endStream(logWriters?.trace), endStream(logWriters?.raw), endStream(logWriters?.stderr)]);
 		if (tempPromptPath) await fs.unlink(tempPromptPath).catch(() => undefined);
 		if (tempPromptDir) await fs.rm(tempPromptDir, { recursive: true, force: true }).catch(() => undefined);
 	}

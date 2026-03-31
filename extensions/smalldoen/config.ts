@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AgentRole } from "./types";
+import type { AgentRole, SubagentLogMode } from "./types";
 
 const PROJECT_ROOT_MARKERS = [".git", "package.json", "pyproject.toml", "Cargo.toml", "go.mod", "composer.json"] as const;
 
@@ -24,6 +24,9 @@ export interface SmalldoenConfig {
 		runsDir?: string;
 		scoutReportsDir?: string;
 		reviewReportsDir?: string;
+	};
+	observability?: {
+		subagentLogs?: SubagentLogMode;
 	};
 	agents?: Partial<Record<AgentRole, AgentRuntimeConfig>>;
 }
@@ -85,6 +88,14 @@ export function getConfiguredModelSpec(cwd: string, role: AgentRole): string | u
 	if (provider && model) return `${provider}/${model}`;
 	if (model) return model;
 	return undefined;
+}
+
+function normalizeSubagentLogMode(value: unknown): SubagentLogMode | undefined {
+	return value === "off" || value === "trace" || value === "full" ? value : undefined;
+}
+
+export function getConfiguredSubagentLogMode(cwd: string): SubagentLogMode {
+	return normalizeSubagentLogMode(loadSmalldoenConfig(cwd).observability?.subagentLogs) ?? "off";
 }
 
 export function getModeIndicatorText(cwd: string): string {

@@ -9,6 +9,9 @@
     "scoutReportsDir": ".pi/smalldoen/reports/scout",
     "reviewReportsDir": ".pi/smalldoen/reports/review"
   },
+  "observability": {
+    "subagentLogs": "off"
+  },
   "agents": {
     "orchestrator": {
       "name": "Orchestrator",

@@ -37,6 +37,9 @@ export interface RunSubagentState {
 	status: "running" | "completed" | "failed";
 	packageId?: string;
 	summary?: string;
+	traceLogPath?: string;
+	rawLogPath?: string;
+	stderrLogPath?: string;
 	updatedAt: string;
 }
 
@@ -227,6 +230,9 @@ export function upsertSubagentState(
 		status: input.status,
 		packageId: input.packageId ?? existing?.packageId,
 		summary: input.summary ?? existing?.summary,
+		traceLogPath: input.traceLogPath ?? existing?.traceLogPath,
+		rawLogPath: input.rawLogPath ?? existing?.rawLogPath,
+		stderrLogPath: input.stderrLogPath ?? existing?.stderrLogPath,
 		updatedAt,
 	};
 	manifest.subagents = [...manifest.subagents.filter((subagent) => subagent.key !== key), next]

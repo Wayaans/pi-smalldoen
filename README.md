@@ -33,6 +33,7 @@ Use `pi-smalldoen` when you want pi to behave more like a disciplined personal d
 - per-role prompt customization
 - per-role provider/model selection
 - project-local config via `.pi/smalldoen.json`
+- optional subagent trace and raw log capture
 - versioned plan files
 - visible orchestrator-led delegation flow
 - isolated child agents per role
@@ -96,6 +97,9 @@ Minimal example:
   "ui": {
     "modeIndicatorText": "Orchestration mode"
   },
+  "observability": {
+    "subagentLogs": "off"
+  },
   "agents": {
     "orchestrator": {
       "provider": "github-copilot",
@@ -134,6 +138,38 @@ For each role, prompt resolution order is:
 3. packaged default prompt at `defaults/agents/<role>.md`
 
 This means the package works immediately after install, while projects can override only the roles they need.
+
+## Subagent logs
+
+Delegated subagents can write optional logs under:
+
+- `.pi/smalldoen/logs/`
+
+Configure the default mode in `.pi/smalldoen.json`:
+
+```json
+{
+  "observability": {
+    "subagentLogs": "off"
+  }
+}
+```
+
+Supported modes:
+
+- `off` — default, no extra log capture
+- `trace` — human-readable subagent trace log
+- `full` — trace log plus raw child JSONL and stderr log
+
+At runtime you can override the current session with:
+
+- `/subagent-logs on`
+- `/subagent-logs off`
+- `/subagent-logs trace`
+- `/subagent-logs full`
+- `/subagent-logs status`
+
+`/subagent-logs on` uses the configured mode when `.pi/smalldoen.json` sets `trace` or `full`. If the config default is `off`, it enables `trace` for the current session.
 
 ## Role hooks
 
@@ -183,6 +219,11 @@ When `/orch` mode is enabled, the top-level session can use:
 - `/orch off`
 - `/orch status`
 - `/smalldoen-status`
+- `/subagent-logs on`
+- `/subagent-logs off`
+- `/subagent-logs trace`
+- `/subagent-logs full`
+- `/subagent-logs status`
 - `/commits`
 - `/commits model`
 - `/commits model reset`
@@ -214,6 +255,7 @@ By default, the package writes artifacts under:
 - `.pi/smalldoen/plans/`
 - `.pi/smalldoen/memory/`
 - `.pi/smalldoen/runs/`
+- `.pi/smalldoen/logs/`
 - `.pi/smalldoen/reports/scout/`
 - `.pi/smalldoen/reports/review/`
 

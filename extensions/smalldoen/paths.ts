@@ -14,6 +14,7 @@ export interface SmalldoenPaths {
 	scoutReportsDir: string;
 	reviewReportsDir: string;
 	runsDir: string;
+	logsDir: string;
 	memoryDir: string;
 	hooksDir: string;
 }
@@ -43,6 +44,7 @@ export function getSmalldoenPaths(cwd: string): SmalldoenPaths {
 		scoutReportsDir,
 		reviewReportsDir,
 		runsDir,
+		logsDir: path.join(artifactsDir, "logs"),
 		memoryDir,
 		hooksDir: path.join(artifactsDir, "hooks"),
 	};
@@ -66,6 +68,10 @@ export function getScoutReportPath(cwd: string, runId: string): string {
 	return path.join(reportDir, `${runId}.md`);
 }
 
+export function getSubagentLogsDir(cwd: string, runId?: string): string {
+	return path.join(getSmalldoenPaths(cwd).logsDir, runId?.trim() || "adhoc");
+}
+
 export function getReviewReportPath(cwd: string, runId: string): string {
 	const config = loadSmalldoenConfig(cwd);
 	const configured = config.agents?.reviewer?.reportDir;
@@ -83,6 +89,7 @@ export async function ensureRuntimeLayout(cwd: string): Promise<void> {
 		paths.scoutReportsDir,
 		paths.reviewReportsDir,
 		paths.runsDir,
+		paths.logsDir,
 		getRoleMemoryDir(cwd, "orchestrator"),
 		getRoleMemoryDir(cwd, "scout"),
 		getRoleMemoryDir(cwd, "planner"),
