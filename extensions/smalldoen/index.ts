@@ -6,7 +6,7 @@ import { getMarkdownTheme, type ExtensionAPI } from "@mariozechner/pi-coding-age
 import { Container, Markdown, Spacer, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { getAgentConfig } from "./agents";
-import { getConfiguredModelSpec, getConfigPath, hasSmalldoenConfig } from "./config";
+import { findProjectRoot, getConfiguredModelSpec, getConfigPath, hasSmalldoenConfig } from "./config";
 import { buildDocsContext, fetchUrl, searchDocs } from "./docs";
 import { runDelegatedRole, workerRoles, type WorkerRole } from "./delegate";
 import {
@@ -32,7 +32,6 @@ import {
 } from "./plan";
 import {
 	ensureRuntimeLayout,
-	findProjectRoot,
 	getReviewReportPath,
 	getScoutReportPath,
 } from "./paths";
@@ -689,7 +688,6 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			if (!allowedWithoutConfig.some((command) => text === command || text.startsWith(`${command} `))) {
 				const guidance = buildMissingConfigGuidance(ctx.cwd);
 				ctx.ui.notify(guidance.message, "error");
-				ctx.ui.setEditorText(guidance.editorText);
 				return { action: "handled" as const };
 			}
 			return { action: "continue" as const };
@@ -738,7 +736,6 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			if (next && !hasSmalldoenConfig(ctx.cwd)) {
 				const guidance = buildMissingConfigGuidance(ctx.cwd);
 				ctx.ui.notify(guidance.message, "warning");
-				ctx.ui.setEditorText(guidance.editorText);
 			}
 			await refreshRunVisualization(ctx);
 		},

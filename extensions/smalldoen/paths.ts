@@ -1,7 +1,6 @@
-import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { loadSmalldoenConfig } from "./config";
+import { findProjectRoot, loadSmalldoenConfig } from "./config";
 import type { AgentRole } from "./types";
 
 export interface SmalldoenPaths {
@@ -16,17 +15,6 @@ export interface SmalldoenPaths {
 	reviewReportsDir: string;
 	runsDir: string;
 	memoryDir: string;
-}
-
-export function findProjectRoot(cwd: string): string {
-	let current = cwd;
-	while (true) {
-		const candidate = path.join(current, ".pi");
-		if (syncFs.existsSync(candidate)) return current;
-		const parent = path.dirname(current);
-		if (parent === current) return cwd;
-		current = parent;
-	}
 }
 
 export function getSmalldoenPaths(cwd: string): SmalldoenPaths {

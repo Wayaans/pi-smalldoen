@@ -2,6 +2,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentRole } from "./types";
 
+const PROJECT_ROOT_MARKERS = [".git", "package.json", "pyproject.toml", "Cargo.toml", "go.mod", "composer.json"] as const;
+
 export interface AgentRuntimeConfig {
 	name?: string;
 	description?: string;
@@ -26,15 +28,23 @@ export interface SmalldoenConfig {
 	agents?: Partial<Record<AgentRole, AgentRuntimeConfig>>;
 }
 
-function findProjectRoot(cwd: string): string {
-	let current = cwd;
+function hasProjectRootMarker(dir: string): boolean {
+	return PROJECT_ROOT_MARKERS.some((marker) => fs.existsSync(path.join(dir, marker)));
+}
+
+export function findProjectRoot(cwd: string): string {
+	let current = path.resolve(cwd);
+	let nearestMarkedRoot: string | undefined;
+
 	while (true) {
-		const candidate = path.join(current, ".pi");
-		if (fs.existsSync(candidate)) return current;
+		if (fs.existsSync(path.join(current, ".pi", "smalldoen.json"))) return current;
+		if (!nearestMarkedRoot && hasProjectRootMarker(current)) nearestMarkedRoot = current;
 		const parent = path.dirname(current);
-		if (parent === current) return cwd;
+		if (parent === current) break;
 		current = parent;
 	}
+
+	return nearestMarkedRoot ?? path.resolve(cwd);
 }
 
 function readJsonIfExists(filePath: string): SmalldoenConfig | undefined {
