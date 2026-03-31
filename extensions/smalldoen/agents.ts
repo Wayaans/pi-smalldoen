@@ -37,8 +37,10 @@ export function discoverProjectAgents(cwd: string): AgentConfig[] {
 		const configuredPrompt = roleConfig.prompt ? resolveConfigPath(cwd, roleConfig.prompt) : undefined;
 		const projectPrompt = path.join(agentsDir, `${role}.md`);
 		const packagedPrompt = getPackagedDefaultPrompt(role);
-		const filePath = configuredPrompt ?? (fs.existsSync(projectPrompt) ? projectPrompt : packagedPrompt);
-		if (!fs.existsSync(filePath)) continue;
+		const filePath = [configuredPrompt, projectPrompt, packagedPrompt]
+			.filter((candidate): candidate is string => Boolean(candidate))
+			.find((candidate) => fs.existsSync(candidate));
+		if (!filePath) continue;
 
 		let content = "";
 		try {

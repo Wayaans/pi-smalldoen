@@ -13,7 +13,6 @@
     "orchestrator": {
       "name": "Orchestrator",
       "description": "Top-level orchestration controller",
-      "prompt": ".pi/agents/orchestrator.md",
       "provider": "github-copilot",
       "model": "claude-opus-4.6",
       "memoryDir": ".pi/smalldoen/memory/orchestrator"
@@ -21,7 +20,6 @@
     "scout": {
       "name": "Scout",
       "description": "Codebase scout and documentation validator",
-      "prompt": ".pi/agents/scout.md",
       "provider": "github-copilot",
       "model": "gemini-3-pro",
       "memoryDir": ".pi/smalldoen/memory/scout",
@@ -30,7 +28,6 @@
     "planner": {
       "name": "Planner",
       "description": "Versioned implementation planner",
-      "prompt": ".pi/agents/planner.md",
       "provider": "github-copilot",
       "model": "claude-sonnet-4.5",
       "memoryDir": ".pi/smalldoen/memory/planner"
@@ -38,7 +35,6 @@
     "engineer": {
       "name": "Engineer",
       "description": "Implementation worker for code and logic",
-      "prompt": ".pi/agents/engineer.md",
       "provider": "github-copilot",
       "model": "claude-sonnet-4.5",
       "memoryDir": ".pi/smalldoen/memory/engineer"
@@ -46,7 +42,6 @@
     "designer": {
       "name": "Designer",
       "description": "Implementation worker for UI, UX, and frontend presentation",
-      "prompt": ".pi/agents/designer.md",
       "provider": "github-copilot",
       "model": "claude-sonnet-4.5",
       "memoryDir": ".pi/smalldoen/memory/designer"
@@ -54,7 +49,6 @@
     "reviewer": {
       "name": "Reviewer",
       "description": "Reviewer for changed files and affected files",
-      "prompt": ".pi/agents/reviewer.md",
       "provider": "github-copilot",
       "model": "claude-opus-4.6",
       "memoryDir": ".pi/smalldoen/memory/reviewer",

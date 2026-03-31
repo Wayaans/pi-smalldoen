@@ -65,6 +65,15 @@ Then reload pi:
 4. Start pi
 5. Enable orchestration mode:
 
+You can copy the packaged example first:
+
+```bash
+mkdir -p .pi
+cp /absolute/path/to/@wayanary/pi-smalldoen/defaults/smalldoen.example.json .pi/smalldoen.json
+```
+
+When the config file is missing, `/orch` prints the exact example path for your installation.
+
 ```bash
 /orch on
 ```
@@ -77,7 +86,9 @@ Create this file in the target project:
 
 - `.pi/smalldoen.json`
 
-Example:
+The packaged full example lives at `defaults/smalldoen.example.json` inside the installed package.
+
+Minimal example:
 
 ```json
 {

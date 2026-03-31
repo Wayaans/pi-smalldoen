@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { getMarkdownTheme, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Container, Markdown, Spacer, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
@@ -31,6 +32,7 @@ import {
 } from "./plan";
 import {
 	ensureRuntimeLayout,
+	findProjectRoot,
 	getReviewReportPath,
 	getScoutReportPath,
 } from "./paths";
@@ -64,6 +66,7 @@ const DOCS_LOOKUP_TOOL_NAME = "docs_lookup" as const;
 const INSPECT_PLAN_TOOL_NAME = "inspect_plan" as const;
 const MANAGE_RUN_TOOL_NAME = "manage_run" as const;
 const SMALLDOEN_RUN_WIDGET_KEY = "smalldoen-run-widget" as const;
+const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const modeState: OrchestrationModeState = { enabled: false };
 const runtimeRole = getRuntimeRole();
 
@@ -308,9 +311,31 @@ async function refreshRunVisualization(ctx: any): Promise<void> {
 	applyRunVisualization(ctx, activeManifest, true);
 }
 
+function getDefaultConfigExamplePath(): string {
+	return path.join(packageRoot, "defaults", "smalldoen.example.json");
+}
+
+function buildMissingConfigGuidance(cwd: string): { message: string; editorText: string } {
+	const projectRoot = findProjectRoot(cwd);
+	const configPath = getConfigPath(cwd);
+	const examplePath = getDefaultConfigExamplePath();
+	const copyCommand = `mkdir -p "${path.dirname(configPath)}" && cp "${examplePath}" "${configPath}"`;
+	return {
+		message: `Missing orchestration config. Create .pi/smalldoen.json in the project root: ${configPath}`,
+		editorText: [
+			"Missing orchestration config.",
+			"",
+			`Create this file in the project root: ${configPath}`,
+			`Project root: ${projectRoot}`,
+			`Default example config: ${examplePath}`,
+			`Copy example: ${copyCommand}`,
+		].join("\n"),
+	};
+}
+
 function ensureConfigPresent(cwd: string): void {
 	if (hasSmalldoenConfig(cwd)) return;
-	throw new Error(`Missing orchestration config: ${getConfigPath(cwd)}. Create .pi/smalldoen.json first.`);
+	throw new Error(buildMissingConfigGuidance(cwd).editorText);
 }
 
 function liveSubagentKey(input: { runId?: string; role: WorkerRole; packageId?: string; label?: string }): string {
@@ -662,9 +687,9 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		const allowedWithoutConfig = ["/orch", "/reload", "/smalldoen-status"];
 		if (!hasSmalldoenConfig(ctx.cwd)) {
 			if (!allowedWithoutConfig.some((command) => text === command || text.startsWith(`${command} `))) {
-				const configPath = path.relative(ctx.cwd, getConfigPath(ctx.cwd)) || ".pi/smalldoen.json";
-				ctx.ui.notify(`Missing ${configPath}. Create it before using orchestration mode.`, "error");
-				ctx.ui.setEditorText(`Create ${configPath} first, then try again.`);
+				const guidance = buildMissingConfigGuidance(ctx.cwd);
+				ctx.ui.notify(guidance.message, "error");
+				ctx.ui.setEditorText(guidance.editorText);
 				return { action: "handled" as const };
 			}
 			return { action: "continue" as const };
@@ -711,7 +736,9 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			syncTopLevelTools(pi);
 			ctx.ui.notify(describeMode(next), "info");
 			if (next && !hasSmalldoenConfig(ctx.cwd)) {
-				ctx.ui.notify(`Missing ${path.relative(ctx.cwd, getConfigPath(ctx.cwd)) || ".pi/smalldoen.json"}. Create it before using orchestration mode.`, "warning");
+				const guidance = buildMissingConfigGuidance(ctx.cwd);
+				ctx.ui.notify(guidance.message, "warning");
+				ctx.ui.setEditorText(guidance.editorText);
 			}
 			await refreshRunVisualization(ctx);
 		},
