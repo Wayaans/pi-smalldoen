@@ -38,6 +38,8 @@ Use `pi-smalldoen` when you want pi to behave more like a disciplined personal d
 - isolated child agents per role
 - package-based plan inspection and scheduling
 - live run widget and status tracking
+- `Ctrl+Shift+I` unified subagent window with tab navigation
+- `/commits` command for model-assisted git commits in `/orch` mode
 - project-local memory, reports, and run manifests
 - docs validation tool for orchestrator and scout
 
@@ -182,6 +184,25 @@ When `/orch` mode is enabled, the top-level session can use:
 - `/orch off`
 - `/orch status`
 - `/smalldoen-status`
+- `/commits`
+- `/commits model`
+- `/commits model reset`
+
+## Subagent window
+
+While `/orch` mode is active, press `Ctrl+Shift+I` to open or close the live subagent window.
+
+When more than one subagent is running, the window shows tabs across the top. Use the left and right arrow keys to switch tabs.
+
+Press `Esc` to close the window.
+
+## Commits command
+
+While `/orch` mode is active, run `/commits` to stage and commit the current project changes.
+
+The command generates a commit message with an auto-selected fast/cheap model by default, then lets you review the message before the commit is created.
+
+Use `/commits model` to choose a specific model for commit-message generation, or `/commits model reset` to go back to automatic model selection.
 
 ## Workflow
 

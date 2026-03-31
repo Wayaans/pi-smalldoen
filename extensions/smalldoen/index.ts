@@ -1,9 +1,9 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { StringEnum } from "@mariozechner/pi-ai";
-import { getMarkdownTheme, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Container, Markdown, Spacer, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { complete, StringEnum } from "@mariozechner/pi-ai";
+import { BorderedLoader, getMarkdownTheme, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { getAgentConfig } from "./agents";
 import { findProjectRoot, getConfiguredModelSpec, getConfigPath, hasSmalldoenConfig } from "./config";
@@ -71,6 +71,23 @@ const modeState: OrchestrationModeState = { enabled: false };
 const runtimeRole = getRuntimeRole();
 
 let activeRunId: string | undefined;
+let commitsModelSpec: string | undefined;
+
+const SMALLDOEN_COMMITS_MODEL_ENTRY = "smalldoen-commits-model" as const;
+const COMMITS_SYSTEM_PROMPT = `You write concise, high-signal git commit messages.
+
+Rules:
+- Output only the commit message text.
+- No markdown fences, bullets, quotes, or commentary.
+- Prefer a conventional-commit style prefix when it is clearly justified, such as feat, fix, refactor, docs, test, or chore.
+- Use imperative mood.
+- Keep the subject line under 72 characters when possible.
+- Focus on user-visible behavior and meaningful implementation changes, not incidental tooling noise.`;
+
+interface CommitsModelEntry {
+	spec?: string;
+	updatedAt: string;
+}
 
 interface LiveSubagentState {
 	key: string;
@@ -87,7 +104,8 @@ interface LiveSubagentState {
 
 const liveSubagents = new Map<string, LiveSubagentState>();
 const liveSubagentOrder: string[] = [];
-const liveSubagentOverlays = new Map<number, { handle: { hide(): void }; panel: SubagentOverlayPanel; stateKey: string }>();
+let subagentWindowHandle: { hide(): void } | undefined;
+let subagentWindowPanel: SubagentWindowPanel | undefined;
 
 const ORCHESTRATOR_RUNTIME_PROMPT = `
 Orchestration mode is enabled for this session.
@@ -213,6 +231,153 @@ function compactPath(cwd: string, filePath?: string, segmentCount = 3): string |
 	if (!relative) return undefined;
 	const parts = relative.split(/[\\/]/).filter(Boolean);
 	return parts.length <= segmentCount ? relative : `…/${parts.slice(-segmentCount).join("/")}`;
+}
+
+function restoreCommitsModel(ctx: any): void {
+	commitsModelSpec = undefined;
+	for (const entry of ctx.sessionManager.getBranch() as Array<any>) {
+		if (entry.type !== "custom" || entry.customType !== SMALLDOEN_COMMITS_MODEL_ENTRY) continue;
+		const spec = (entry.data as CommitsModelEntry | undefined)?.spec?.trim();
+		commitsModelSpec = spec || undefined;
+	}
+}
+
+function persistCommitsModel(pi: ExtensionAPI, spec?: string): string | undefined {
+	const normalized = spec?.trim() || undefined;
+	commitsModelSpec = normalized;
+	pi.appendEntry(SMALLDOEN_COMMITS_MODEL_ENTRY, {
+		spec: normalized,
+		updatedAt: new Date().toISOString(),
+	});
+	return normalized;
+}
+
+function formatModelSpec(model: { provider: string; id: string }): string {
+	return `${model.provider}/${model.id}`;
+}
+
+function rankCommitModel(model: any): [number, number, string] {
+	const identity = `${formatModelSpec(model)} ${String(model.name ?? "")}`.toLowerCase();
+	const cost = Number(model.cost?.input ?? 0)
+		+ Number(model.cost?.output ?? 0)
+		+ Number(model.cost?.cacheRead ?? 0)
+		+ Number(model.cost?.cacheWrite ?? 0);
+	let tier = 1;
+	if (/(flash|mini|haiku|nano|small|lite|instant)/.test(identity)) tier = 0;
+	if (/(opus|pro|reasoning|thinking|o1|o3|r1|grok-4|large)/.test(identity)) tier = 3;
+	if (/(sonnet|gpt-4o|gpt-4\.1(?!-mini)|gemini-2\.5-pro)/.test(identity)) tier = Math.max(tier, 2);
+	return [tier, cost, formatModelSpec(model)];
+}
+
+function pickDefaultCommitsModel(ctx: any): any | undefined {
+	const available = ctx.modelRegistry.getAvailable().filter((model: any) => model.input?.includes("text"));
+	if (available.length === 0) return ctx.model;
+	return [...available].sort((a, b) => {
+		const [tierA, costA, labelA] = rankCommitModel(a);
+		const [tierB, costB, labelB] = rankCommitModel(b);
+		return tierA - tierB || costA - costB || labelA.localeCompare(labelB);
+	})[0];
+}
+
+function resolveCommitsModel(ctx: any): { model: any | undefined; source: "selected" | "auto" } {
+	if (commitsModelSpec) {
+		const [provider, ...rest] = commitsModelSpec.split("/");
+		const modelId = rest.join("/");
+		if (provider && modelId) {
+			const model = ctx.modelRegistry.find(provider, modelId);
+			if (model && ctx.modelRegistry.hasConfiguredAuth(model)) return { model, source: "selected" };
+		}
+	}
+	return { model: pickDefaultCommitsModel(ctx), source: "auto" };
+}
+
+function normalizeCommitMessage(value: string): string {
+	const trimmed = value.trim();
+	if (!trimmed) return "";
+	const unwrapped = trimmed.replace(/^['"`]+|['"`]+$/g, "");
+	return unwrapped
+		.split("\n")
+		.map((line) => line.trimEnd())
+		.join("\n")
+		.trim();
+}
+
+function extractTextContent(content: unknown): string {
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((part): part is { type: "text"; text: string } => typeof part === "object" && part !== null && (part as any).type === "text" && typeof (part as any).text === "string")
+		.map((part) => part.text)
+		.join("\n");
+}
+
+function getLastAssistantText(ctx: any): string | undefined {
+	for (let index = ctx.sessionManager.getBranch().length - 1; index >= 0; index--) {
+		const entry = ctx.sessionManager.getBranch()[index];
+		if (entry?.type !== "message") continue;
+		const message = entry.message;
+		if (message?.role !== "assistant") continue;
+		const text = extractTextContent(message.content).trim();
+		if (text) return text;
+	}
+	return undefined;
+}
+
+function truncatePromptSection(title: string, value: string | undefined, maxChars: number): string {
+	const normalized = value?.trim() || "(none)";
+	if (normalized.length <= maxChars) return `${title}:\n${normalized}`;
+	return `${title}:\n${normalized.slice(0, maxChars)}\n… [truncated ${normalized.length - maxChars} chars]`;
+}
+
+function parseChangedPathsFromStatus(status: string): string[] {
+	const files = new Set<string>();
+	for (const line of status.split("\n")) {
+		const raw = line.trimEnd();
+		if (!raw) continue;
+		const file = raw.slice(3).split(" -> ").pop()?.trim();
+		if (file) files.add(file);
+	}
+	return Array.from(files);
+}
+
+function fallbackCommitMessage(changedFiles: string[]): string {
+	if (changedFiles.length === 1) return `chore: update ${path.basename(changedFiles[0])}`;
+	if (changedFiles.length > 1 && changedFiles.length <= 3) return `chore: update ${changedFiles.length} project files`;
+	return "chore: update project files";
+}
+
+async function generateCommitMessageDraft(ctx: any, model: any, promptText: string): Promise<string | null> {
+	const run = async (signal?: AbortSignal) => {
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+		if (!auth.ok) throw new Error(auth.error);
+		if (!auth.apiKey) throw new Error(`No API key for ${model.provider}`);
+		const response = await complete(
+			model,
+			{
+				systemPrompt: COMMITS_SYSTEM_PROMPT,
+				messages: [{
+					role: "user",
+					content: [{ type: "text", text: promptText }],
+					timestamp: Date.now(),
+				}],
+			},
+			{ apiKey: auth.apiKey, headers: auth.headers, signal },
+		);
+		if (response.stopReason === "aborted") return null;
+		return normalizeCommitMessage(extractTextContent(response.content));
+	};
+
+	if (!ctx.hasUI) return run(ctx.signal);
+	return ctx.ui.custom((tui: any, theme: any, _kb: any, done: (result: string | null) => void) => {
+		const loader = new BorderedLoader(tui, theme, `Generating commit message with ${formatModelSpec(model)}...`);
+		loader.onAbort = () => done(null);
+		run(loader.signal)
+			.then(done)
+			.catch((error) => {
+				console.error("Commit message generation failed:", error);
+				done(null);
+			});
+		return loader;
+	});
 }
 
 function packageCounts(manifest: RunManifest) {
@@ -347,8 +512,9 @@ function liveSubagentKey(input: { runId?: string; role: WorkerRole; packageId?: 
 }
 
 function resetLiveSubagents(): void {
-	for (const overlay of liveSubagentOverlays.values()) overlay.handle.hide();
-	liveSubagentOverlays.clear();
+	subagentWindowHandle?.hide();
+	subagentWindowHandle = undefined;
+	subagentWindowPanel = undefined;
 	liveSubagents.clear();
 	liveSubagentOrder.splice(0, liveSubagentOrder.length);
 }
@@ -381,13 +547,11 @@ function upsertLiveSubagent(input: {
 	return state;
 }
 
-function getLiveSubagentForSlot(slot: number): LiveSubagentState | undefined {
-	const key = liveSubagentOrder[slot - 1];
-	return key ? liveSubagents.get(key) : undefined;
-}
-
 function refreshLiveSubagentOverlays(): void {
-	for (const overlay of liveSubagentOverlays.values()) overlay.panel.invalidate();
+	if (subagentWindowPanel) {
+		subagentWindowPanel.invalidate();
+		subagentWindowPanel.requestRender();
+	}
 }
 
 function effectiveStageLabel(manifest: RunManifest): string {
@@ -401,73 +565,171 @@ function effectiveStageLabel(manifest: RunManifest): string {
 	return manifest.stage.toUpperCase();
 }
 
-class SubagentOverlayPanel {
+class SubagentWindowPanel {
+	private selectedIndex = 0;
+	private cachedLines?: string[];
+	private cachedWidth?: number;
+
 	constructor(
 		private readonly tui: any,
 		private readonly theme: any,
-		private readonly slot: number,
-		private readonly getState: () => LiveSubagentState | undefined,
+		private readonly getStates: () => LiveSubagentState[],
+		private readonly onClose: () => void,
 	) {}
 
-	invalidate(): void {
+	requestRender(): void {
 		this.tui.requestRender();
 	}
 
+	handleInput(data: string): void {
+		const states = this.getStates();
+		if (matchesKey(data, Key.escape)) {
+			this.onClose();
+			return;
+		}
+		const maxIndex = Math.max(0, states.length - 1);
+		if (this.selectedIndex > maxIndex) this.selectedIndex = maxIndex;
+		if (matchesKey(data, Key.left) && this.selectedIndex > 0) {
+			this.selectedIndex--;
+			this.invalidate();
+			this.tui.requestRender();
+		} else if (matchesKey(data, Key.right) && this.selectedIndex < states.length - 1) {
+			this.selectedIndex++;
+			this.invalidate();
+			this.tui.requestRender();
+		}
+	}
+
+	invalidate(): void {
+		this.cachedLines = undefined;
+		this.cachedWidth = undefined;
+	}
+
 	render(width: number): string[] {
-		const state = this.getState();
-		if (!state) return [];
+		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
+
+		const states = this.getStates();
+		if (states.length === 0) {
+			this.cachedLines = [this.theme.fg("dim", " No active subagents ")];
+			this.cachedWidth = width;
+			return this.cachedLines;
+		}
+
+		const idx = Math.min(this.selectedIndex, states.length - 1);
+		this.selectedIndex = idx;
+		const state = states[idx]!;
 		const innerWidth = Math.max(30, width - 2);
 		const pad = (line: string) => line + " ".repeat(Math.max(0, innerWidth - visibleWidth(line)));
 		const row = (line = "") => `${this.theme.fg("dim", "│")}${pad(line)}${this.theme.fg("dim", "│")}`;
 		const lines: string[] = [];
+		const statusColor = state.status === "running" ? "warning" : state.status === "success" ? "success" : "error";
 		lines.push(this.theme.fg("dim", `╭${"─".repeat(innerWidth)}╮`));
-		lines.push(row(` ${this.theme.fg("accent", this.theme.bold(`SUBAGENT ${this.slot}`))} ${this.theme.fg("toolTitle", `${state.label} → ${state.role}`)}`));
-		lines.push(row(` ${this.theme.fg(state.status === "running" ? "warning" : state.status === "success" ? "success" : "error", state.status.toUpperCase())}${state.model ? this.theme.fg("dim", `  ${state.model}`) : ""}`));
+
+		if (states.length > 1) {
+			const divider = this.theme.fg("dim", "│");
+			const labels = states.map((subagent, index) => {
+				const rawLabel = truncateToWidth(`${subagent.slot}:${subagent.label}`, 18, "…");
+				const label = ` ${rawLabel} `;
+				return index === idx
+					? this.theme.fg("accent", this.theme.bold(label))
+					: this.theme.fg("muted", label);
+			});
+			const joinTabs = (start: number, end: number) => {
+				const leftEllipsis = start > 0 ? `${this.theme.fg("dim", "…")}${divider}` : "";
+				const rightEllipsis = end < labels.length - 1 ? `${divider}${this.theme.fg("dim", "…")}` : "";
+				return `${leftEllipsis}${labels.slice(start, end + 1).join(divider)}${rightEllipsis}`;
+			};
+			let start = idx;
+			let end = idx;
+			let tabLine = joinTabs(start, end);
+			while (true) {
+				let expanded = false;
+				if (start > 0) {
+					const nextLine = joinTabs(start - 1, end);
+					if (visibleWidth(nextLine) <= innerWidth) {
+						start--;
+						tabLine = nextLine;
+						expanded = true;
+					}
+				}
+				if (end < labels.length - 1) {
+					const nextLine = joinTabs(start, end + 1);
+					if (visibleWidth(nextLine) <= innerWidth) {
+						end++;
+						tabLine = nextLine;
+						expanded = true;
+					}
+				}
+				if (!expanded) break;
+			}
+			lines.push(row(tabLine));
+			lines.push(row(this.theme.fg("dim", "─".repeat(innerWidth))));
+		}
+
+		lines.push(row(` ${this.theme.fg("accent", this.theme.bold(state.label))}  ${this.theme.fg("toolTitle", `→ ${state.role}`)}`));
+		lines.push(row(` ${this.theme.fg(statusColor, state.status.toUpperCase())}${state.model ? this.theme.fg("dim", `  ${state.model}`) : ""}`));
 		if (state.runId) lines.push(row(` ${this.theme.fg("dim", `run ${state.runId}`)}`));
 		lines.push(row(""));
-		const content = state.output?.trim() ? state.output.trim() : "(waiting for subagent output...)";
-		for (const line of content.split("\n").slice(-14)) {
+
+		const content = state.output?.trim() || "(waiting for subagent output...)";
+		for (const line of content.split("\n").slice(-20)) {
 			lines.push(row(` ${truncateToWidth(line, innerWidth - 2, "")}`));
 		}
+
+		const navHint = states.length > 1 ? "  ←/→ switch tab" : "";
+		lines.push(row(` ${this.theme.fg("dim", `esc close${navHint}`)}`));
 		lines.push(this.theme.fg("dim", `╰${"─".repeat(innerWidth)}╯`));
+
+		this.cachedLines = lines;
+		this.cachedWidth = width;
 		return lines;
 	}
+
 	dispose(): void {}
 }
 
-async function toggleSubagentOverlay(slot: number, ctx: any): Promise<void> {
-	const existing = liveSubagentOverlays.get(slot);
-	if (existing) {
-		existing.handle.hide();
-		liveSubagentOverlays.delete(slot);
+async function toggleSubagentWindow(ctx: any): Promise<void> {
+	if (subagentWindowHandle) {
+		subagentWindowHandle.hide();
+		subagentWindowHandle = undefined;
+		subagentWindowPanel = undefined;
 		return;
 	}
-	const state = getLiveSubagentForSlot(slot);
-	if (!state) {
-		ctx.ui.notify(`No subagent mapped to Ctrl+${slot}.`, "info");
+	if (liveSubagents.size === 0) {
+		ctx.ui.notify("No active subagents.", "info");
 		return;
 	}
-	let panel: SubagentOverlayPanel | undefined;
-	void ctx.ui.custom(
-		(tui: any, theme: any, _keybindings: any, _done: () => void) => {
-			panel = new SubagentOverlayPanel(tui, theme, slot, () => getLiveSubagentForSlot(slot));
-			return panel;
-		},
-		{
-			overlay: true,
-			overlayOptions: {
-				anchor: "top-right",
-				width: "48%",
-				maxHeight: "45%",
-				margin: { top: 2 + (slot - 1) * 2, right: 2 },
+	let panel: SubagentWindowPanel | undefined;
+	void ctx.ui
+		.custom(
+			(tui: any, theme: any, _keybindings: any, done: () => void) => {
+				panel = new SubagentWindowPanel(
+					tui,
+					theme,
+					() => liveSubagentOrder
+						.map((key) => liveSubagents.get(key))
+						.filter((state): state is LiveSubagentState => Boolean(state)),
+					done,
+				);
+				subagentWindowPanel = panel;
+				return panel;
 			},
-			onHandle: (handle: any) => {
-				if (panel) liveSubagentOverlays.set(slot, { handle, panel, stateKey: state.key });
+			{
+				overlay: true,
+				overlayOptions: {
+					anchor: "center",
+					width: "75%",
+					maxHeight: "70%",
+				},
+				onHandle: (handle: any) => {
+					subagentWindowHandle = handle;
+				},
 			},
-		},
-	).finally(() => {
-		liveSubagentOverlays.delete(slot);
-	});
+		)
+		.finally(() => {
+			subagentWindowHandle = undefined;
+			subagentWindowPanel = undefined;
+		});
 }
 
 async function writeReport(filePath: string, content: string): Promise<void> {
@@ -585,12 +847,12 @@ function renderDelegateResult(details: DelegateToolDetails, expanded: boolean, i
 	const stateKey = isPartial
 		? liveSubagentKey({ runId: details.runId, role: details.role as WorkerRole, packageId: details.packageId, label: details.label })
 		: undefined;
-	const liveSlot = stateKey ? liveSubagents.get(stateKey)?.slot : undefined;
+	const isLive = stateKey ? liveSubagents.has(stateKey) : false;
 	const metaBits = [
 		theme.fg(statusColor, statusIcon(status)),
 		details.model ? theme.fg("dim", details.model) : undefined,
 		details.runId ? theme.fg("dim", details.runId) : undefined,
-		isPartial && liveSlot ? theme.fg("dim", `Ctrl+${liveSlot} to expand`) : undefined,
+		isPartial && isLive ? theme.fg("dim", "Ctrl+Shift+I to view") : undefined,
 	].filter(Boolean).join("  ");
 	const preview = details.finalOutput ? summarizeText(details.finalOutput, 4) : "(running...)";
 	if (!expanded) return new Text(`${metaBits}\n${theme.fg("toolOutput", preview)}`, 0, 0);
@@ -696,6 +958,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		await ensureRuntimeLayout(ctx.cwd);
 		restoreOrchestrationMode(ctx, modeState);
+		restoreCommitsModel(ctx);
 		syncTopLevelTools(pi);
 		if (modeState.enabled && !runtimeRole) await applyConfiguredOrchestratorModel(pi, ctx, modeState);
 		resetLiveSubagents();
@@ -706,6 +969,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 	pi.on("session_switch", async (_event, ctx) => {
 		await ensureRuntimeLayout(ctx.cwd);
 		restoreOrchestrationMode(ctx, modeState);
+		restoreCommitsModel(ctx);
 		syncTopLevelTools(pi);
 		if (modeState.enabled && !runtimeRole) await applyConfiguredOrchestratorModel(pi, ctx, modeState);
 		resetLiveSubagents();
@@ -793,16 +1057,179 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("commits", {
+		description: "Commit current project changes in /orch mode. Use /commits model to pick the commit-message model.",
+		handler: async (args, ctx) => {
+			if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) {
+				ctx.ui.notify("/commits is available only when /orch mode is enabled.", "warning");
+				return;
+			}
+
+			const command = (args || "").trim();
+			const lower = command.toLowerCase();
+			if (!["", "model", "model reset"].includes(lower)) {
+				ctx.ui.notify("Usage: /commits, /commits model, /commits model reset", "warning");
+				return;
+			}
+
+			if (lower === "model reset") {
+				persistCommitsModel(pi, undefined);
+				const autoModel = pickDefaultCommitsModel(ctx);
+				ctx.ui.notify(autoModel ? `Reset /commits model. Using auto selection: ${formatModelSpec(autoModel)}` : "Reset /commits model. Auto selection will be used.", "info");
+				return;
+			}
+
+			if (lower === "model") {
+				if (!ctx.hasUI) {
+					ctx.ui.notify("/commits model requires interactive UI.", "error");
+					return;
+				}
+				const available = ctx.modelRegistry.getAvailable().filter((model: any) => model.input?.includes("text"));
+				if (available.length === 0) {
+					ctx.ui.notify("No available models found for /commits.", "error");
+					return;
+				}
+				const autoModel = pickDefaultCommitsModel(ctx);
+				const sorted = [...available].sort((a, b) => {
+					const [tierA, costA, labelA] = rankCommitModel(a);
+					const [tierB, costB, labelB] = rankCommitModel(b);
+					return tierA - tierB || costA - costB || labelA.localeCompare(labelB);
+				});
+				const optionMap = new Map<string, string | undefined>();
+				const autoLabel = autoModel
+					? `Auto (recommended): ${formatModelSpec(autoModel)}${commitsModelSpec ? "" : " [current]"}`
+					: `Auto (recommended)${commitsModelSpec ? "" : " [current]"}`;
+				optionMap.set(autoLabel, undefined);
+				for (const model of sorted) {
+					const spec = formatModelSpec(model);
+					const label = `${spec}${commitsModelSpec === spec ? " [current]" : ""} — ${model.name}`;
+					optionMap.set(label, spec);
+				}
+				const selected = await ctx.ui.select("Choose the model /commits should use", Array.from(optionMap.keys()));
+				if (!selected) return;
+				const spec = optionMap.get(selected);
+				persistCommitsModel(pi, spec);
+				ctx.ui.notify(spec ? `Set /commits model to ${spec}` : autoModel ? `Reset /commits model. Using auto selection: ${formatModelSpec(autoModel)}` : "Reset /commits model. Auto selection will be used.", "info");
+				return;
+			}
+
+			await ctx.waitForIdle();
+			const projectRoot = findProjectRoot(ctx.cwd);
+			const repoRootResult = await pi.exec("git", ["-C", projectRoot, "rev-parse", "--show-toplevel"]);
+			if (repoRootResult.code !== 0) {
+				ctx.ui.notify("/commits requires a git repository.", "error");
+				return;
+			}
+			const repoRoot = repoRootResult.stdout.trim();
+			const scopePath = path.relative(repoRoot, projectRoot) || ".";
+			const scopeArgs = ["--", scopePath];
+			const isWithinScope = (filePath: string) => scopePath === "." || filePath === scopePath || filePath.startsWith(`${scopePath}/`);
+			if (scopePath !== ".") {
+				const stagedRepoWide = await pi.exec("git", ["-C", repoRoot, "diff", "--cached", "--name-only"]);
+				const stagedOutsideScope = stagedRepoWide.stdout
+					.split("\n")
+					.map((line) => line.trim())
+					.filter(Boolean)
+					.filter((filePath) => !isWithinScope(filePath));
+				if (stagedOutsideScope.length > 0) {
+					ctx.ui.notify(`Refusing to commit because staged changes exist outside this project: ${stagedOutsideScope.slice(0, 4).join(", ")}`, "warning");
+					return;
+				}
+			}
+
+			const [statusResult, stagedStatResult, unstagedStatResult, stagedDiffResult, unstagedDiffResult, untrackedResult] = await Promise.all([
+				pi.exec("git", ["-C", repoRoot, "status", "--porcelain", ...scopeArgs]),
+				pi.exec("git", ["-C", repoRoot, "diff", "--cached", "--stat", ...scopeArgs]),
+				pi.exec("git", ["-C", repoRoot, "diff", "--stat", ...scopeArgs]),
+				pi.exec("git", ["-C", repoRoot, "diff", "--cached", "--unified=0", "--no-ext-diff", "--no-color", ...scopeArgs]),
+				pi.exec("git", ["-C", repoRoot, "diff", "--unified=0", "--no-ext-diff", "--no-color", ...scopeArgs]),
+				pi.exec("git", ["-C", repoRoot, "ls-files", "--others", "--exclude-standard", ...scopeArgs]),
+			]);
+
+			const status = statusResult.stdout.trim();
+			if (!status) {
+				ctx.ui.notify("No project changes to commit.", "info");
+				return;
+			}
+			const changedFiles = parseChangedPathsFromStatus(statusResult.stdout);
+			const assistantContext = summarizeText(getLastAssistantText(ctx) || "", 12);
+			const { model: commitModel, source } = resolveCommitsModel(ctx);
+			if (commitsModelSpec && source === "auto") {
+				ctx.ui.notify(`Saved /commits model unavailable, falling back to auto selection${commitModel ? ` (${formatModelSpec(commitModel)})` : ""}.`, "warning");
+			}
+
+			const promptText = [
+				"Generate one git commit message for these project changes.",
+				`Project root: ${projectRoot}`,
+				`Git repo root: ${repoRoot}`,
+				truncatePromptSection("Recent assistant context", assistantContext, 3000),
+				truncatePromptSection("Git status", statusResult.stdout, 4000),
+				truncatePromptSection("Staged diff stat", stagedStatResult.stdout, 2500),
+				truncatePromptSection("Unstaged diff stat", unstagedStatResult.stdout, 2500),
+				truncatePromptSection("Untracked files", untrackedResult.stdout, 2000),
+				truncatePromptSection("Staged diff excerpt", stagedDiffResult.stdout, 10000),
+				truncatePromptSection("Unstaged diff excerpt", unstagedDiffResult.stdout, 10000),
+			].join("\n\n");
+
+			let draftMessage = fallbackCommitMessage(changedFiles);
+			if (commitModel) {
+				const generated = await generateCommitMessageDraft(ctx, commitModel, promptText);
+				if (generated === null) {
+					ctx.ui.notify("Commit cancelled.", "info");
+					return;
+				}
+				if (generated.trim()) draftMessage = generated.trim();
+			} else {
+				ctx.ui.notify("No configured model available for /commits, using a fallback draft message.", "warning");
+			}
+
+			let finalMessage = draftMessage;
+			if (ctx.hasUI) {
+				const edited = await ctx.ui.editor("Edit commit message", draftMessage);
+				if (edited === undefined) {
+					ctx.ui.notify("Commit cancelled.", "info");
+					return;
+				}
+				finalMessage = normalizeCommitMessage(edited);
+			}
+			if (!finalMessage) {
+				ctx.ui.notify("Commit message cannot be empty.", "error");
+				return;
+			}
+
+			if (ctx.hasUI) {
+				const confirm = await ctx.ui.confirm(
+					"Create git commit?",
+					`This will stage and commit ${changedFiles.length} changed file${changedFiles.length === 1 ? "" : "s"} for ${scopePath === "." ? path.basename(projectRoot) || projectRoot : scopePath}.\n\n${finalMessage}`,
+				);
+				if (!confirm) {
+					ctx.ui.notify("Commit cancelled.", "info");
+					return;
+				}
+			}
+
+			const addResult = await pi.exec("git", ["-C", repoRoot, "add", "-A", ...scopeArgs]);
+			if (addResult.code !== 0) {
+				ctx.ui.notify(addResult.stderr.trim() || "Failed to stage project changes.", "error");
+				return;
+			}
+			const commitResult = await pi.exec("git", ["-C", repoRoot, "commit", "-m", finalMessage]);
+			if (commitResult.code !== 0) {
+				ctx.ui.notify(commitResult.stderr.trim() || commitResult.stdout.trim() || "git commit failed.", "error");
+				return;
+			}
+			ctx.ui.notify(`Committed project changes: ${finalMessage}`, "info");
+		},
+	});
+
 	if (!runtimeRole) {
-		for (let slot = 1; slot <= 9; slot++) {
-			pi.registerShortcut(`ctrl+${slot}` as any, {
-				description: `Toggle smalldoen subagent overlay ${slot}`,
-				handler: async (ctx) => {
-					if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) return;
-					await toggleSubagentOverlay(slot, ctx);
-				},
-			});
-		}
+		pi.registerShortcut("ctrl+shift+i", {
+			description: "Toggle smalldoen subagent window",
+			handler: async (ctx) => {
+				if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) return;
+				await toggleSubagentWindow(ctx);
+			},
+		});
 	}
 
 	const shouldRegisterDocsLookup = !runtimeRole || runtimeRole === "scout";
