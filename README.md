@@ -134,6 +134,38 @@ For each role, prompt resolution order is:
 
 This means the package works immediately after install, while projects can override only the roles they need.
 
+## Role hooks
+
+When orchestration mode is active, the runtime looks for additive hook files in `.pi/smalldoen/hooks/`.
+
+These files do not replace the normal role prompt chain. The existing role prompt behavior stays the same:
+- `.pi/smalldoen.json` can point a role at a custom prompt
+- `.pi/agents/<role>.md` can override a role in the project
+- packaged defaults still act as the fallback
+
+Role hooks are appended at runtime to the effective system prompt after that normal resolution step. They are extra project-local guidance, not a new prompt source.
+
+If the `.pi/smalldoen/hooks/` directory does not exist, or if any hook file is missing, the runtime skips it silently.
+
+### Supported hook files
+
+| File | Loaded for |
+|------|------------|
+| `.pi/smalldoen/hooks/agent.md` | Top-level orchestrator only |
+| `.pi/smalldoen/hooks/subagent.md` | All delegated subagents |
+| `.pi/smalldoen/hooks/scout.md` | Scout subagent only |
+| `.pi/smalldoen/hooks/planner.md` | Planner subagent only |
+| `.pi/smalldoen/hooks/engineer.md` | Engineer subagent only |
+| `.pi/smalldoen/hooks/designer.md` | Designer subagent only |
+| `.pi/smalldoen/hooks/reviewer.md` | Reviewer subagent only |
+
+### Layering order
+
+- Top-level orchestrator: `agent.md`
+- Delegated subagents: `subagent.md`, then the matching role file such as `engineer.md` or `designer.md`
+
+When more than one hook applies, the runtime concatenates the non-empty files in that order and appends them as runtime guidance. The injected block is labeled `Project-local hook:`.
+
 ## Available tools in orchestration mode
 
 When `/orch` mode is enabled, the top-level session can use:

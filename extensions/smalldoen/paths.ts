@@ -15,6 +15,7 @@ export interface SmalldoenPaths {
 	reviewReportsDir: string;
 	runsDir: string;
 	memoryDir: string;
+	hooksDir: string;
 }
 
 export function getSmalldoenPaths(cwd: string): SmalldoenPaths {
@@ -43,6 +44,7 @@ export function getSmalldoenPaths(cwd: string): SmalldoenPaths {
 		reviewReportsDir,
 		runsDir,
 		memoryDir,
+		hooksDir: path.join(artifactsDir, "hooks"),
 	};
 }
 

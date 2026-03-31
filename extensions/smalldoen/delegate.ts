@@ -1,4 +1,5 @@
 import { getAgentConfig } from "./agents";
+import { buildSubagentHookContent } from "./hooks";
 import { buildRoleMemoryContext, recordRoleExecution } from "./memory";
 import {
 	getLatestPlanPath,
@@ -67,6 +68,13 @@ export async function runDelegatedRole(params: RunDelegatedRoleParams): Promise<
 	}
 	else if (roleMemoryContext) {
 		appendPrompt = roleMemoryContext;
+	}
+
+	const hookContent = await buildSubagentHookContent(cwd, role);
+	if (hookContent) {
+		appendPrompt = appendPrompt
+			? `${appendPrompt}\n\nProject-local hook:\n${hookContent}`
+			: `Project-local hook:\n${hookContent}`;
 	}
 
 	const childResult = await runChildAgent({

@@ -16,6 +16,7 @@ import {
 	isReadOnlyBashCommand,
 	isTopLevelOrchestrationModeEnabled,
 } from "./guards";
+import { buildAgentHookContent } from "./hooks";
 import { buildRoleMemoryContext } from "./memory";
 import {
 	applyModeIndicator,
@@ -1202,8 +1203,9 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) return;
 		const orchestratorMemory = await buildRoleMemoryContext("orchestrator", ctx.cwd);
 		const orchestratorPrompt = await buildOrchestratorPrompt(ctx.cwd);
+		const hookContent = await buildAgentHookContent(ctx.cwd);
 		return {
-			systemPrompt: `${event.systemPrompt}\n\n${orchestratorPrompt}${orchestratorMemory ? `\n\n${orchestratorMemory}` : ""}`,
+			systemPrompt: `${event.systemPrompt}\n\n${orchestratorPrompt}${orchestratorMemory ? `\n\n${orchestratorMemory}` : ""}${hookContent ? `\n\nProject-local hook:\n${hookContent}` : ""}`,
 		};
 	});
 
