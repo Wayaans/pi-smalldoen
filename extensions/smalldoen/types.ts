@@ -76,4 +76,5 @@ export interface ManageRunDetails {
 	activeSubagentCount: number;
 	completedPackageCount: number;
 	failedPackageCount: number;
+	packageId?: string;
 }

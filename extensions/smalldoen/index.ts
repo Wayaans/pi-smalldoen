@@ -303,7 +303,11 @@ async function refreshRunVisualization(ctx: any): Promise<void> {
 		applyRunVisualization(ctx, undefined, false);
 		return;
 	}
-	const manifest = await loadLatestRunManifest(ctx.cwd);
+	if (!activeRunId) {
+		applyRunVisualization(ctx, undefined, true);
+		return;
+	}
+	const manifest = await loadRunManifest(ctx.cwd, activeRunId);
 	const activeManifest = manifest?.status === "active" ? manifest : undefined;
 	if (!activeManifest) resetLiveSubagents();
 	setActiveRun(activeManifest);
@@ -439,7 +443,7 @@ async function toggleSubagentOverlay(slot: number, ctx: any): Promise<void> {
 	}
 	const state = getLiveSubagentForSlot(slot);
 	if (!state) {
-		ctx.ui.notify(`No subagent mapped to Ctrl+Shift+${slot}.`, "info");
+		ctx.ui.notify(`No subagent mapped to Ctrl+Alt+${slot}.`, "info");
 		return;
 	}
 	let panel: SubagentOverlayPanel | undefined;
@@ -516,7 +520,11 @@ function buildPlanInspectionDetails(plan: ParsedPlan, packageIds?: string[]): Pl
 	};
 }
 
-function buildManageRunDetails(action: ManageRunDetails["action"], manifest: RunManifest): ManageRunDetails {
+function buildManageRunDetails(
+	action: ManageRunDetails["action"],
+	manifest: RunManifest,
+	extra?: { packageId?: string },
+): ManageRunDetails {
 	const counts = packageCounts(manifest);
 	return {
 		action,
@@ -532,6 +540,7 @@ function buildManageRunDetails(action: ManageRunDetails["action"], manifest: Run
 		activeSubagentCount: activeSubagents(manifest).length,
 		completedPackageCount: counts.completed,
 		failedPackageCount: counts.failed,
+		packageId: extra?.packageId,
 	};
 }
 
@@ -572,10 +581,15 @@ function formatManifestSummary(manifest: RunManifest): string {
 function renderDelegateResult(details: DelegateToolDetails, expanded: boolean, isPartial: boolean, theme: any) {
 	const status = isPartial ? "running" : details.status;
 	const statusColor = status === "success" ? "success" : status === "running" ? "warning" : status === "aborted" ? "muted" : "error";
+	const stateKey = isPartial
+		? liveSubagentKey({ runId: details.runId, role: details.role as WorkerRole, packageId: details.packageId, label: details.label })
+		: undefined;
+	const liveSlot = stateKey ? liveSubagents.get(stateKey)?.slot : undefined;
 	const metaBits = [
 		theme.fg(statusColor, statusIcon(status)),
 		details.model ? theme.fg("dim", details.model) : undefined,
 		details.runId ? theme.fg("dim", details.runId) : undefined,
+		isPartial && liveSlot ? theme.fg("dim", `Ctrl+Alt+${liveSlot} to expand`) : undefined,
 	].filter(Boolean).join("  ");
 	const preview = details.finalOutput ? summarizeText(details.finalOutput, 4) : "(running...)";
 	if (!expanded) return new Text(`${metaBits}\n${theme.fg("toolOutput", preview)}`, 0, 0);
@@ -611,15 +625,30 @@ function renderInspectPlanResult(details: PlanInspectionDetails, expanded: boole
 }
 
 function renderManageRunResult(details: ManageRunDetails, expanded: boolean, theme: any) {
-	const summary = [
-		theme.fg("muted", `[○ ${details.packageCount}]`),
-		theme.fg("success", `[✓ ${details.completedPackageCount}]`),
-		theme.fg("error", `[✗ ${details.failedPackageCount}]`),
-	].join(" ");
-	if (!expanded) return new Text(summary, 0, 0);
+	const contextDetail = details.packageId ?? (details.action === "start" || details.action === "status"
+		? details.feature
+		: details.action === "finish"
+			? details.status
+			: details.stage ?? details.feature);
+	const metaBits = [
+		theme.fg("success", "✓"),
+		theme.fg("muted", details.action),
+		theme.fg("toolOutput", contextDetail),
+		theme.fg("dim", details.runId),
+	].filter(Boolean).join("  ");
+	const counterLine = details.packageCount > 0
+		? [
+				theme.fg("muted", `[○ ${details.packageCount}]`),
+				theme.fg("success", `[✓ ${details.completedPackageCount}]`),
+				theme.fg("error", `[✗ ${details.failedPackageCount}]`),
+			].join(" ")
+		: undefined;
+	if (!expanded) return new Text([metaBits, counterLine].filter(Boolean).join("\n"), 0, 0);
 	const lines = [
-		summary,
+		metaBits,
+		counterLine,
 		theme.fg("dim", `stage ${details.stage}`),
+		details.planPath ? theme.fg("dim", `plan ${details.planPath}`) : undefined,
 		details.review ? theme.fg("dim", `review ${details.review.verdict} / ${details.review.routingHint}`) : undefined,
 	].filter(Boolean).join("\n");
 	return new Text(lines, 0, 0);
@@ -668,6 +697,8 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		restoreOrchestrationMode(ctx, modeState);
 		syncTopLevelTools(pi);
 		if (modeState.enabled && !runtimeRole) await applyConfiguredOrchestratorModel(pi, ctx, modeState);
+		resetLiveSubagents();
+		setActiveRun(undefined);
 		await refreshRunVisualization(ctx);
 	});
 
@@ -676,6 +707,8 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		restoreOrchestrationMode(ctx, modeState);
 		syncTopLevelTools(pi);
 		if (modeState.enabled && !runtimeRole) await applyConfiguredOrchestratorModel(pi, ctx, modeState);
+		resetLiveSubagents();
+		setActiveRun(undefined);
 		await refreshRunVisualization(ctx);
 	});
 
@@ -737,6 +770,10 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 				const guidance = buildMissingConfigGuidance(ctx.cwd);
 				ctx.ui.notify(guidance.message, "warning");
 			}
+			if (!current && next) {
+				resetLiveSubagents();
+				setActiveRun(undefined);
+			}
 			await refreshRunVisualization(ctx);
 		},
 	});
@@ -757,8 +794,8 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 
 	if (!runtimeRole) {
 		for (let slot = 1; slot <= 9; slot++) {
-			pi.registerShortcut(`ctrl+shift+${slot}` as any, {
-				description: `Toggle smalldoen subagent panel ${slot}`,
+			pi.registerShortcut(`ctrl+alt+${slot}` as any, {
+				description: `Toggle smalldoen subagent overlay ${slot}`,
 				handler: async (ctx) => {
 					if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) return;
 					await toggleSubagentOverlay(slot, ctx);
@@ -785,7 +822,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: buildDocsContext(result) }], details: result };
 			},
 			renderCall(args, theme) {
-				return new Text(`${theme.fg("toolTitle", theme.bold("docs_lookup "))}${theme.fg("accent", args.url ?? args.query ?? "")}`, 0, 0);
+				return new Text(`${theme.fg("toolTitle", theme.bold("Looking up "))}${theme.fg("accent", "[DOCS_LOOKUP]")} ${theme.fg("toolOutput", args.url ?? args.query ?? "")}`, 0, 0);
 			},
 			renderResult(result, { expanded }, theme) {
 				const text = result.content[0]?.type === "text" ? result.content[0].text : "(no output)";
@@ -875,7 +912,10 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 					});
 					setActiveRun(nextManifest);
 					applyRunVisualization(ctx, nextManifest, true);
-					return { content: [{ type: "text", text: formatManifestSummary(nextManifest) }], details: buildManageRunDetails("package", nextManifest) };
+					return {
+						content: [{ type: "text", text: formatManifestSummary(nextManifest) }],
+						details: buildManageRunDetails("package", nextManifest, { packageId: params.packageId.trim() }),
+					};
 				}
 
 				if (params.action === "review") {
@@ -963,8 +1003,8 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 				};
 			},
 			renderCall(args, theme) {
-				const label = args.planPath ? args.planPath : args.feature || "latest-plan";
-				return new Text(`${theme.fg("toolTitle", theme.bold("inspect_plan "))}${theme.fg("accent", label)}`, 0, 0);
+				const label = args.planPath ? path.basename(args.planPath) : args.feature || "latest-plan";
+				return new Text(`${theme.fg("toolTitle", theme.bold("Inspecting "))}${theme.fg("accent", "[INSPECT_PLAN]")} ${theme.fg("toolOutput", label)}`, 0, 0);
 			},
 			renderResult(result, { expanded }, theme) {
 				const details = result.details as PlanInspectionDetails | undefined;
