@@ -444,7 +444,7 @@ async function toggleSubagentOverlay(slot: number, ctx: any): Promise<void> {
 	}
 	const state = getLiveSubagentForSlot(slot);
 	if (!state) {
-		ctx.ui.notify(`No subagent mapped to Ctrl+Alt+${slot}.`, "info");
+		ctx.ui.notify(`No subagent mapped to Ctrl+${slot}.`, "info");
 		return;
 	}
 	let panel: SubagentOverlayPanel | undefined;
@@ -590,7 +590,7 @@ function renderDelegateResult(details: DelegateToolDetails, expanded: boolean, i
 		theme.fg(statusColor, statusIcon(status)),
 		details.model ? theme.fg("dim", details.model) : undefined,
 		details.runId ? theme.fg("dim", details.runId) : undefined,
-		isPartial && liveSlot ? theme.fg("dim", `Ctrl+Alt+${liveSlot} to expand`) : undefined,
+		isPartial && liveSlot ? theme.fg("dim", `Ctrl+${liveSlot} to expand`) : undefined,
 	].filter(Boolean).join("  ");
 	const preview = details.finalOutput ? summarizeText(details.finalOutput, 4) : "(running...)";
 	if (!expanded) return new Text(`${metaBits}\n${theme.fg("toolOutput", preview)}`, 0, 0);
@@ -795,7 +795,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 
 	if (!runtimeRole) {
 		for (let slot = 1; slot <= 9; slot++) {
-			pi.registerShortcut(`ctrl+alt+${slot}` as any, {
+			pi.registerShortcut(`ctrl+${slot}` as any, {
 				description: `Toggle smalldoen subagent overlay ${slot}`,
 				handler: async (ctx) => {
 					if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) return;
