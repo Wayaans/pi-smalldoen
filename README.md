@@ -39,6 +39,7 @@ Use `pi-smalldoen` when you want pi to behave more like a disciplined personal d
 - package-based plan inspection and scheduling
 - live run widget and status tracking
 - `Ctrl+Shift+I` unified subagent window with tab navigation
+- live subagent telemetry with tool activity, partial output, and assistant progress
 - `/commits` command for model-assisted git commits in `/orch` mode
 - project-local memory, reports, and run manifests
 - docs validation tool for orchestrator and scout
@@ -191,6 +192,12 @@ When `/orch` mode is enabled, the top-level session can use:
 ## Subagent window
 
 While `/orch` mode is active, press `Ctrl+Shift+I` to open or close the live subagent window.
+
+The window streams live subagent telemetry, including:
+- recent execution events
+- active tool calls
+- partial tool output
+- the latest assistant progress text
 
 When more than one subagent is running, the window shows tabs across the top. Use the left and right arrow keys to switch tabs.
 

@@ -36,15 +36,118 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	return { command: "pi", args };
 }
 
+function getMessageText(message: Message | undefined): string {
+	if (!message) return "";
+	if (typeof message.content === "string") return message.content;
+	if (!Array.isArray(message.content)) return "";
+	return message.content
+		.filter((part): part is { type: "text"; text: string } => part?.type === "text" && typeof (part as any).text === "string")
+		.map((part) => part.text)
+		.join("");
+}
+
 function getFinalOutput(messages: Message[]): string {
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
 		if (message.role !== "assistant") continue;
-		for (const part of message.content) {
-			if (part.type === "text") return part.text;
-		}
+		const text = getMessageText(message);
+		if (text) return text;
 	}
 	return "";
+}
+
+function truncate(text: string, max: number): string {
+	if (text.length <= max) return text;
+	return `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
+}
+
+function stringifyToolArgs(args: unknown): string {
+	if (!args || typeof args !== "object") return "";
+	const value = args as Record<string, unknown>;
+	if (typeof value.command === "string") return truncate(value.command.replace(/\s+/g, " ").trim(), 120);
+	if (typeof value.path === "string") return value.path;
+	if (Array.isArray(value.paths)) return truncate(value.paths.join(", "), 120);
+	if (Array.isArray(value.edits)) {
+		const pathLabel = typeof value.path === "string" ? `${value.path} ` : "";
+		return `${pathLabel}(${value.edits.length} edit${value.edits.length === 1 ? "" : "s"})`;
+	}
+	try {
+		return truncate(JSON.stringify(args), 120);
+	} catch {
+		return "";
+	}
+}
+
+function getToolResultText(result: any): string {
+	if (!result || typeof result !== "object") return "";
+	const content = Array.isArray(result.content) ? result.content : [];
+	return content
+		.filter((part: any) => part?.type === "text" && typeof part.text === "string")
+		.map((part: any) => part.text)
+		.join("\n")
+		.trim();
+}
+
+function summarizeToolResultText(text: string): string {
+	const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+	if (lines.length === 0) return "";
+	return truncate(lines[lines.length - 1]!, 120);
+}
+
+interface LiveToolTrace {
+	toolName: string;
+	args: unknown;
+	output: string;
+}
+
+interface ChildLiveTrace {
+	recentEvents: string[];
+	activeTools: Map<string, LiveToolTrace>;
+	activeToolOrder: string[];
+	assistantStreaming: string;
+	lastAssistant: string;
+}
+
+function pushRecentEvent(trace: ChildLiveTrace, text: string): void {
+	if (!text.trim()) return;
+	trace.recentEvents.push(text.trim());
+	if (trace.recentEvents.length > 12) trace.recentEvents.splice(0, trace.recentEvents.length - 12);
+}
+
+function renderLiveTrace(trace: ChildLiveTrace): string {
+	const sections: string[] = [];
+	if (trace.recentEvents.length > 0) {
+		sections.push(["Events:", ...trace.recentEvents.slice(-6).map((line) => `- ${line}`)].join("\n"));
+	}
+
+	const activeIds = trace.activeToolOrder.filter((id) => trace.activeTools.has(id));
+	if (activeIds.length > 0) {
+		const toolBlocks = activeIds.map((id) => {
+			const tool = trace.activeTools.get(id)!;
+			const header = `- ${tool.toolName}${stringifyToolArgs(tool.args) ? `: ${stringifyToolArgs(tool.args)}` : ""}`;
+			const outputLines = (tool.output || "(waiting for tool output...)")
+				.split(/\r?\n/)
+				.filter((line) => line.trim().length > 0)
+				.slice(-8)
+				.map((line) => `  ${truncate(line, 140)}`);
+			return [header, ...outputLines].join("\n");
+		});
+		sections.push(["Active tools:", ...toolBlocks].join("\n"));
+	}
+
+	const assistantText = (trace.assistantStreaming || trace.lastAssistant).trim();
+	if (assistantText) {
+		sections.push([
+			"Assistant:",
+			...assistantText
+				.split(/\r?\n/)
+				.filter((line) => line.trim().length > 0)
+				.slice(-8)
+				.map((line) => truncate(line, 140)),
+		].join("\n"));
+	}
+
+	return sections.join("\n\n").trim();
 }
 
 async function writeTempPrompt(role: AgentRole, content: string): Promise<{ dir: string; filePath: string }> {
@@ -92,6 +195,20 @@ export async function runChildAgent(options: ChildInvocationOptions): Promise<Ch
 			});
 
 			let buffer = "";
+			const trace: ChildLiveTrace = {
+				recentEvents: [],
+				activeTools: new Map(),
+				activeToolOrder: [],
+				assistantStreaming: "",
+				lastAssistant: "",
+			};
+			let lastRenderedTrace = "";
+			const emitTrace = () => {
+				const nextTrace = renderLiveTrace(trace);
+				if (!nextTrace || nextTrace === lastRenderedTrace) return;
+				lastRenderedTrace = nextTrace;
+				onUpdate?.(nextTrace);
+			};
 
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
@@ -102,6 +219,65 @@ export async function runChildAgent(options: ChildInvocationOptions): Promise<Ch
 					return;
 				}
 
+				if (event.type === "turn_start") {
+					pushRecentEvent(trace, "turn started");
+					emitTrace();
+					return;
+				}
+
+				if (event.type === "message_start" && event.message?.role === "assistant") {
+					trace.assistantStreaming = "";
+					emitTrace();
+					return;
+				}
+
+				if (event.type === "message_update" && event.message?.role === "assistant") {
+					if (event.assistantMessageEvent?.type === "text_delta" && typeof event.assistantMessageEvent.delta === "string") {
+						trace.assistantStreaming += event.assistantMessageEvent.delta;
+					} else {
+						trace.assistantStreaming = getMessageText(event.message as Message) || trace.assistantStreaming;
+					}
+					emitTrace();
+					return;
+				}
+
+				if (event.type === "tool_execution_start") {
+					trace.activeTools.set(event.toolCallId, {
+						toolName: event.toolName,
+						args: event.args,
+						output: "",
+					});
+					if (!trace.activeToolOrder.includes(event.toolCallId)) trace.activeToolOrder.push(event.toolCallId);
+					pushRecentEvent(trace, `${event.toolName} started${stringifyToolArgs(event.args) ? `: ${stringifyToolArgs(event.args)}` : ""}`);
+					emitTrace();
+					return;
+				}
+
+				if (event.type === "tool_execution_update") {
+					const tool = trace.activeTools.get(event.toolCallId);
+					if (tool) tool.output = getToolResultText(event.partialResult);
+					emitTrace();
+					return;
+				}
+
+				if (event.type === "tool_execution_end") {
+					const tool = trace.activeTools.get(event.toolCallId);
+					const resultText = getToolResultText(event.result);
+					pushRecentEvent(
+						trace,
+						`${event.toolName} ${event.isError ? "failed" : "finished"}${stringifyToolArgs(event.args) ? `: ${stringifyToolArgs(event.args)}` : ""}`,
+					);
+					if (tool) {
+						tool.output = resultText || tool.output;
+						trace.activeTools.delete(event.toolCallId);
+						trace.activeToolOrder = trace.activeToolOrder.filter((id) => id !== event.toolCallId);
+					}
+					const resultSummary = summarizeToolResultText(resultText || tool?.output || "");
+					if (resultSummary) pushRecentEvent(trace, `${event.toolName} output: ${resultSummary}`);
+					emitTrace();
+					return;
+				}
+
 				if (event.type === "message_end" && event.message) {
 					const message = event.message as Message & { stopReason?: string; errorMessage?: string; model?: string };
 					messages.push(message);
@@ -109,8 +285,17 @@ export async function runChildAgent(options: ChildInvocationOptions): Promise<Ch
 						stopReason = message.stopReason;
 						errorMessage = message.errorMessage;
 						model = message.model;
-						onUpdate?.(getFinalOutput(messages));
+						trace.lastAssistant = getMessageText(message) || trace.lastAssistant;
+						trace.assistantStreaming = "";
+						pushRecentEvent(trace, "assistant finished");
+						emitTrace();
 					}
+					return;
+				}
+
+				if (event.type === "turn_end") {
+					pushRecentEvent(trace, "turn finished");
+					emitTrace();
 				}
 			};
 
