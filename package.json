@@ -12,7 +12,6 @@
   ],
   "files": [
     "extensions",
-    "prompts",
     "defaults",
     "README.md"
   ],
@@ -24,9 +23,6 @@
   "pi": {
     "extensions": [
       "./extensions/smalldoen/index.ts"
-    ],
-    "prompts": [
-      "./prompts"
     ]
   },
   "peerDependencies": {

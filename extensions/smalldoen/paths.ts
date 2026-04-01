@@ -6,7 +6,6 @@ import type { AgentRole } from "./types";
 export interface SmalldoenPaths {
 	root: string;
 	agentsDir: string;
-	promptsDir: string;
 	extensionDir: string;
 	artifactsDir: string;
 	plansDir: string;
@@ -17,6 +16,7 @@ export interface SmalldoenPaths {
 	logsDir: string;
 	memoryDir: string;
 	hooksDir: string;
+	summariesDir: string;
 }
 
 export function getSmalldoenPaths(cwd: string): SmalldoenPaths {
@@ -36,7 +36,6 @@ export function getSmalldoenPaths(cwd: string): SmalldoenPaths {
 	return {
 		root: projectPiDir,
 		agentsDir: path.join(projectPiDir, "agents"),
-		promptsDir: path.join(projectPiDir, "prompts"),
 		extensionDir: path.join(projectPiDir, "extensions", "smalldoen"),
 		artifactsDir,
 		plansDir,
@@ -47,6 +46,7 @@ export function getSmalldoenPaths(cwd: string): SmalldoenPaths {
 		logsDir: path.join(artifactsDir, "logs"),
 		memoryDir,
 		hooksDir: path.join(artifactsDir, "hooks"),
+		summariesDir: path.join(artifactsDir, "summaries"),
 	};
 }
 
@@ -79,17 +79,21 @@ export function getReviewReportPath(cwd: string, runId: string): string {
 	return path.join(reportDir, `${runId}.md`);
 }
 
+export function getRunSummaryPath(cwd: string, runId: string): string {
+	return path.join(getSmalldoenPaths(cwd).summariesDir, `${runId}.md`);
+}
+
 export async function ensureRuntimeLayout(cwd: string): Promise<void> {
 	const paths = getSmalldoenPaths(cwd);
 	const directories = [
 		paths.agentsDir,
-		paths.promptsDir,
 		paths.extensionDir,
 		paths.plansDir,
 		paths.scoutReportsDir,
 		paths.reviewReportsDir,
 		paths.runsDir,
 		paths.logsDir,
+		paths.summariesDir,
 		getRoleMemoryDir(cwd, "orchestrator"),
 		getRoleMemoryDir(cwd, "scout"),
 		getRoleMemoryDir(cwd, "planner"),
