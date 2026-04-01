@@ -88,8 +88,6 @@ export function getRunSummaryPath(cwd: string, runId: string): string {
 export async function ensureRuntimeLayout(cwd: string): Promise<void> {
 	const paths = getSmalldoenPaths(cwd);
 	const directories = [
-		paths.agentsDir,
-		paths.extensionDir,
 		paths.plansDir,
 		paths.scoutReportsDir,
 		paths.reviewReportsDir,

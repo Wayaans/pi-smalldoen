@@ -20,16 +20,10 @@ pi install -l git@github.com:Wayaans/pi-smalldoen.git
 
 ## Quick start
 
-1. Create `.pi/smalldoen.json`
-2. Enable a mode
-3. Start working
+1. Enable a mode
+2. Start working
 
-Copy the packaged example if needed:
-
-```bash
-mkdir -p .pi
-cp /absolute/path/to/@wayanary/pi-smalldoen/defaults/smalldoen.example.json .pi/smalldoen.json
-```
+If `.pi/smalldoen.json` is missing, smalldoen copies the packaged default config into `.pi/` automatically.
 
 Then use one of these:
 
@@ -96,7 +90,7 @@ Examples:
 - `/commits model`
 - `/commits model reset`
 
-## Minimal config
+## Default config
 
 ```json
 {

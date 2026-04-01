@@ -643,15 +643,15 @@ function getDefaultConfigExamplePath(): string {
 	return path.join(packageRoot, "defaults", "smalldoen.example.json");
 }
 
-function buildMissingConfigGuidance(cwd: string): { message: string; editorText: string } {
+function buildConfigSeedFailureGuidance(cwd: string): { message: string; editorText: string } {
 	const projectRoot = findProjectRoot(cwd);
 	const configPath = getConfigPath(cwd);
 	const examplePath = getDefaultConfigExamplePath();
 	const copyCommand = `mkdir -p "${path.dirname(configPath)}" && cp "${examplePath}" "${configPath}"`;
 	return {
-		message: `Missing orchestration config. Create .pi/smalldoen.json in the project root: ${configPath}`,
+		message: `Failed to create .pi/smalldoen.json automatically: ${configPath}`,
 		editorText: [
-			"Missing orchestration config.",
+			"Failed to create smalldoen config automatically.",
 			"",
 			`Create this file in the project root: ${configPath}`,
 			`Project root: ${projectRoot}`,
@@ -661,9 +661,26 @@ function buildMissingConfigGuidance(cwd: string): { message: string; editorText:
 	};
 }
 
-function ensureConfigPresent(cwd: string): void {
-	if (hasSmalldoenConfig(cwd)) return;
-	throw new Error(buildMissingConfigGuidance(cwd).editorText);
+async function ensureConfigPresent(cwd: string): Promise<boolean> {
+	if (hasSmalldoenConfig(cwd)) return false;
+	const configPath = getConfigPath(cwd);
+	const examplePath = getDefaultConfigExamplePath();
+	try {
+		await fs.mkdir(path.dirname(configPath), { recursive: true });
+		await fs.copyFile(examplePath, configPath, fsSync.constants.COPYFILE_EXCL);
+		return true;
+	} catch (error) {
+		const code = error && typeof error === "object" ? (error as { code?: string }).code : undefined;
+		if (code === "EEXIST") return false;
+		const guidance = buildConfigSeedFailureGuidance(cwd);
+		const detail = error instanceof Error ? error.message : String(error);
+		throw new Error(`${guidance.editorText}\n\nOriginal error: ${detail}`);
+	}
+}
+
+async function ensureOrchestrationRuntime(cwd: string): Promise<void> {
+	await ensureConfigPresent(cwd);
+	await ensureRuntimeLayout(cwd);
 }
 
 function effectiveStageLabel(manifest: RunManifest): string {
@@ -1038,23 +1055,29 @@ function buildRunSummary(manifest: RunManifest, note?: string): string {
 
 export default function smalldoenExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
-		await ensureRuntimeLayout(ctx.cwd);
 		restoreOrchestrationMode(ctx, modeState);
 		restoreCommitsModel(ctx);
 		restoreSubagentLogsMode(ctx);
 		syncTopLevelTools(pi);
-		if (modeState.mode !== "off" && !runtimeRole) await applyTopLevelModeModel(pi, ctx, modeState);
+		if (modeState.mode !== "off" && !runtimeRole) {
+			if (modeState.mode === "orchestrate") await ensureOrchestrationRuntime(ctx.cwd);
+			else await ensureConfigPresent(ctx.cwd);
+			await applyTopLevelModeModel(pi, ctx, modeState);
+		}
 		setActiveRun(undefined);
 		await refreshRunVisualization(ctx);
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
-		await ensureRuntimeLayout(ctx.cwd);
 		restoreOrchestrationMode(ctx, modeState);
 		restoreCommitsModel(ctx);
 		restoreSubagentLogsMode(ctx);
 		syncTopLevelTools(pi);
-		if (modeState.mode !== "off" && !runtimeRole) await applyTopLevelModeModel(pi, ctx, modeState);
+		if (modeState.mode !== "off" && !runtimeRole) {
+			if (modeState.mode === "orchestrate") await ensureOrchestrationRuntime(ctx.cwd);
+			else await ensureConfigPresent(ctx.cwd);
+			await applyTopLevelModeModel(pi, ctx, modeState);
+		}
 		setActiveRun(undefined);
 		await refreshRunVisualization(ctx);
 	});
@@ -1065,14 +1088,11 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		if (!text) return { action: "continue" as const };
 		if (text.startsWith("/orch")) return { action: "continue" as const };
 		if (modeState.mode !== "orchestrate") return { action: "continue" as const };
-		const allowedWithoutConfig = ["/orch", "/reload", "/smalldoen-status", "/subagent-logs"];
-		if (!hasSmalldoenConfig(ctx.cwd)) {
-			if (!allowedWithoutConfig.some((command) => text === command || text.startsWith(`${command} `))) {
-				const guidance = buildMissingConfigGuidance(ctx.cwd);
-				ctx.ui.notify(guidance.message, "error");
-				return { action: "handled" as const };
-			}
-			return { action: "continue" as const };
+		try {
+			await ensureOrchestrationRuntime(ctx.cwd);
+		} catch (error) {
+			ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			return { action: "handled" as const };
 		}
 		if (!activeRunId) return { action: "continue" as const };
 		const manifest = await loadRunManifest(ctx.cwd, activeRunId);
@@ -1151,15 +1171,13 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			else next = toggleOrchestrationMode(pi, ctx, modeState);
 			if (command === "on" || command === "ask" || command === "brainstorm" || command === "off") setOrchestrationMode(pi, ctx, modeState, next);
 			if (!runtimeRole) {
+				if (next === "orchestrate") await ensureOrchestrationRuntime(ctx.cwd);
+				else if (next !== "off") await ensureConfigPresent(ctx.cwd);
 				if (next !== "off") await applyTopLevelModeModel(pi, ctx, modeState);
 				else await restorePreviousModel(pi, ctx, modeState);
 			}
 			syncTopLevelTools(pi);
 			ctx.ui.notify(describeMode(next), "info");
-			if (next === "orchestrate" && !hasSmalldoenConfig(ctx.cwd)) {
-				const guidance = buildMissingConfigGuidance(ctx.cwd);
-				ctx.ui.notify(guidance.message, "warning");
-			}
 			if (current !== next && next !== "orchestrate") setActiveRun(undefined);
 			await refreshRunVisualization(ctx);
 		},
@@ -1467,7 +1485,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			parameters: ManageRunParams,
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 				if (!isTopLevelOrchestrationModeEnabled(modeState.mode)) throw new Error("manage_run is available only when /orch mode is enabled.");
-				ensureConfigPresent(ctx.cwd);
+				await ensureOrchestrationRuntime(ctx.cwd);
 
 				if (params.action === "start") {
 					if (!params.feature?.trim() || !params.objective?.trim()) throw new Error("manage_run start requires feature and objective.");
@@ -1606,7 +1624,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			parameters: InspectPlanParams,
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 				if (!isTopLevelOrchestrationModeEnabled(modeState.mode)) throw new Error("inspect_plan is available only when /orch mode is enabled.");
-				ensureConfigPresent(ctx.cwd);
+				await ensureOrchestrationRuntime(ctx.cwd);
 				const explicitPlanPath = resolveOptionalUserPath(ctx.cwd, params.planPath);
 				let planPath = explicitPlanPath;
 				if (!planPath) {
@@ -1652,7 +1670,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			parameters: DelegateParams,
 			async execute(_toolCallId, params, signal, onUpdate, ctx) {
 				if (!isTopLevelOrchestrationModeEnabled(modeState.mode)) throw new Error("delegate is available only when /orch mode is enabled.");
-				ensureConfigPresent(ctx.cwd);
+				await ensureOrchestrationRuntime(ctx.cwd);
 
 				const configuredRoleModel = getConfiguredModelSpec(ctx.cwd, params.role as WorkerRole);
 				const subagentLogMode = getEffectiveSubagentLogsMode(ctx.cwd);
