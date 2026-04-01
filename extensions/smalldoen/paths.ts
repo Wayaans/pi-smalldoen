@@ -17,6 +17,7 @@ export interface SmalldoenPaths {
 	memoryDir: string;
 	hooksDir: string;
 	summariesDir: string;
+	ideasDir: string;
 }
 
 export function getSmalldoenPaths(cwd: string): SmalldoenPaths {
@@ -47,6 +48,7 @@ export function getSmalldoenPaths(cwd: string): SmalldoenPaths {
 		memoryDir,
 		hooksDir: path.join(artifactsDir, "hooks"),
 		summariesDir: path.join(artifactsDir, "summaries"),
+		ideasDir: path.join(artifactsDir, "ideas"),
 	};
 }
 
@@ -94,6 +96,7 @@ export async function ensureRuntimeLayout(cwd: string): Promise<void> {
 		paths.runsDir,
 		paths.logsDir,
 		paths.summariesDir,
+		paths.ideasDir,
 		getRoleMemoryDir(cwd, "orchestrator"),
 		getRoleMemoryDir(cwd, "scout"),
 		getRoleMemoryDir(cwd, "planner"),

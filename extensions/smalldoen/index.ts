@@ -16,12 +16,13 @@ import {
 	getRuntimeRole,
 	isReadOnlyBashCommand,
 	isTopLevelOrchestrationModeEnabled,
+	isTopLevelSmalldoenModeEnabled,
 } from "./guards";
 import { buildAgentHookContent } from "./hooks";
 import { buildRoleMemoryContext } from "./memory";
 import {
 	applyModeIndicator,
-	getOrchestrationMode,
+	getSmalldoenMode,
 	restoreOrchestrationMode,
 	setOrchestrationMode,
 	toggleOrchestrationMode,
@@ -61,17 +62,21 @@ import {
 	type DelegateToolDetails,
 	type ManageRunDetails,
 	type OrchestrationModeState,
+	type PlanIdeaDetails,
 	type PlanInspectionDetails,
 	type ReviewSummary,
+	type SmalldoenMode,
 	type SubagentLogMode,
 } from "./types";
 
 const DOCS_LOOKUP_TOOL_NAME = "docs_lookup" as const;
 const INSPECT_PLAN_TOOL_NAME = "inspect_plan" as const;
 const MANAGE_RUN_TOOL_NAME = "manage_run" as const;
+const SAVE_PLAN_IDEA_TOOL_NAME = "save_plan_idea" as const;
 const SMALLDOEN_RUN_WIDGET_KEY = "smalldoen-run-widget" as const;
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-const modeState: OrchestrationModeState = { enabled: false };
+const DISCOVERY_MODE_DEFAULT_MODEL_SPEC = "github-copilot/gpt-5.4-mini";
+const modeState: OrchestrationModeState = { mode: "off" };
 const runtimeRole = getRuntimeRole();
 
 let activeRunId: string | undefined;
@@ -113,12 +118,14 @@ const ORCH_REVIEW_TEMPLATE = `Use orchestration mode for this request.
 If orchestration mode is not enabled, tell me to run \`/orch\` first.
 
 Load the latest orchestration run state with \`manage_run\`, inspect the latest plan, and rerun the reviewer in an isolated context with \`delegate\`. Keep the review workflow visible, then return the verdict, critical issues, warnings, rerouting guidance, and updated run status.`;
-const ORCH_USAGE = "Usage: /orch [toggle|on|off|status|implement <description>|continue [context]|review|summary]";
+const ORCH_USAGE = "Usage: /orch [toggle|on|ask|brainstorm|off|status|implement <description>|continue [context]|review|summary]";
 const ORCH_SUBCOMMAND_COMPLETIONS: AutocompleteItem[] = [
-	{ value: "toggle", label: "toggle", description: "Toggle orchestration mode on or off." },
+	{ value: "toggle", label: "toggle", description: "Toggle smalldoen mode on or off." },
 	{ value: "on", label: "on", description: "Enable orchestration mode." },
-	{ value: "off", label: "off", description: "Disable orchestration mode." },
-	{ value: "status", label: "status", description: "Show whether orchestration mode is on or off." },
+	{ value: "ask", label: "ask", description: "Enable ask mode for direct, read-only answers without delegation." },
+	{ value: "brainstorm", label: "brainstorm", description: "Enable brainstorm mode for refining ideas before writing a plan idea." },
+	{ value: "off", label: "off", description: "Disable smalldoen mode." },
+	{ value: "status", label: "status", description: "Show the current smalldoen mode." },
 	{ value: "implement ", label: "implement", description: "Load the implementation template. Continue typing the feature description." },
 	{ value: "continue ", label: "continue", description: "Load the continue template. Continue typing extra context." },
 	{ value: "review", label: "review", description: "Load the review template for the latest orchestration run." },
@@ -164,6 +171,41 @@ Hard rules:
 - After each package finishes, update the run package state with manage_run.
 - Run reviewer only after the relevant packages are complete.
 - If reviewer fails, you decide whether to reroute work, rescout, or replan.
+`;
+
+const ASK_MODE_RUNTIME_PROMPT = `
+Ask mode is enabled for this session.
+
+You are still the visible orchestrator, but this mode is answer-only.
+
+Hard rules:
+- Answer the user directly.
+- Do not use write or edit.
+- Do not implement product code directly.
+- Do not use delegate, manage_run, or inspect_plan.
+- Do not create plans or execute workflow steps.
+- Stay read-only when inspecting the repository.
+- You may use read, read-only bash commands, and docs_lookup when they help you answer accurately.
+- If the user asks you to implement something, explain that ask mode is for questions only and tell them to switch back to normal orchestration mode.
+`;
+
+const BRAINSTORM_MODE_RUNTIME_PROMPT = `
+Brainstorm mode is enabled for this session.
+
+You are still the visible orchestrator, but this mode is for collaborative idea refinement before implementation.
+
+Hard rules:
+- Do not use write or edit.
+- Do not implement product code directly.
+- Do not use delegate, manage_run, or inspect_plan.
+- Do not create implementation plans.
+- Stay in brainstorming mode until the user explicitly says the brainstorming is done or explicitly asks you to write or save the plan idea.
+- Until that moment, do not write files.
+- Help the user turn rough thoughts into a concrete build idea by asking focused questions, surfacing tradeoffs, clarifying scope, and tightening goals, non-goals, and core flows.
+- Keep the discussion collaborative and concrete.
+- When the user explicitly asks you to write or save the plan idea, use save_plan_idea.
+- The resulting plan idea should read like a build brief in collaborative tone, for example "Let's build ...", not like a second-person summary such as "your idea is...".
+- You may use read, read-only bash commands, and docs_lookup when they help the brainstorm.
 `;
 
 const DelegateParams = Type.Object({
@@ -224,13 +266,29 @@ const DocsLookupParams = Type.Object({
 	url: Type.Optional(Type.String({ description: "Direct documentation URL to fetch." })),
 });
 
+const SavePlanIdeaParams = Type.Object({
+	title: Type.String({ description: "Short name for the idea." }),
+	summary: Type.String({ description: "A concise collaborative idea statement written like a build brief, not a second-person recap." }),
+	problem: Type.Optional(Type.String({ description: "Problem, opportunity, or motivation behind the idea." })),
+	users: Type.Optional(Type.Array(Type.String({ description: "Primary users or audiences." }))),
+	goals: Type.Optional(Type.Array(Type.String({ description: "What this idea should achieve." }))),
+	nonGoals: Type.Optional(Type.Array(Type.String({ description: "What is intentionally out of scope." }))),
+	coreFlows: Type.Optional(Type.Array(Type.String({ description: "Key user flows, capabilities, or experiences." }))),
+	scope: Type.Optional(Type.Array(Type.String({ description: "Concrete scope items for the first build." }))),
+	successCriteria: Type.Optional(Type.Array(Type.String({ description: "Signals that the idea works well." }))),
+	slug: Type.Optional(Type.String({ description: "Optional custom file slug. Defaults to a slugified title." })),
+});
+
 function resolveEffectiveRole(): AgentRole | undefined {
 	if (runtimeRole) return runtimeRole;
-	return isTopLevelOrchestrationModeEnabled(modeState.enabled) ? "orchestrator" : undefined;
+	return isTopLevelSmalldoenModeEnabled(modeState.mode) ? "orchestrator" : undefined;
 }
 
-function describeMode(enabled: boolean): string {
-	return enabled ? "Orchestration mode is ON" : "Orchestration mode is OFF";
+function describeMode(mode: SmalldoenMode): string {
+	if (mode === "orchestrate") return "Orchestration mode is ON";
+	if (mode === "ask") return "Ask mode is ON";
+	if (mode === "brainstorm") return "Brainstorm mode is ON";
+	return "Smalldoen modes are OFF";
 }
 
 function resolveOptionalUserPath(cwd: string, input?: string): string | undefined {
@@ -242,10 +300,15 @@ function resolveOptionalUserPath(cwd: string, input?: string): string | undefine
 function syncTopLevelTools(pi: ExtensionAPI): void {
 	if (runtimeRole) return;
 	const activeTools = new Set(pi.getActiveTools());
-	for (const toolName of [DELEGATE_TOOL_NAME, INSPECT_PLAN_TOOL_NAME, MANAGE_RUN_TOOL_NAME, DOCS_LOOKUP_TOOL_NAME]) {
-		if (modeState.enabled) activeTools.add(toolName);
+	const orchestrationOnlyTools = [DELEGATE_TOOL_NAME, INSPECT_PLAN_TOOL_NAME, MANAGE_RUN_TOOL_NAME];
+	for (const toolName of orchestrationOnlyTools) {
+		if (modeState.mode === "orchestrate") activeTools.add(toolName);
 		else activeTools.delete(toolName);
 	}
+	if (isTopLevelSmalldoenModeEnabled(modeState.mode)) activeTools.add(DOCS_LOOKUP_TOOL_NAME);
+	else activeTools.delete(DOCS_LOOKUP_TOOL_NAME);
+	if (modeState.mode === "brainstorm") activeTools.add(SAVE_PLAN_IDEA_TOOL_NAME);
+	else activeTools.delete(SAVE_PLAN_IDEA_TOOL_NAME);
 	pi.setActiveTools(Array.from(activeTools));
 }
 
@@ -515,10 +578,10 @@ function rightAlign(value: string, width: number): string {
 	return `${" ".repeat(padding)}${value}`;
 }
 
-function buildModeBadgeLine(theme: any, manifest: RunManifest | undefined, enabled: boolean): string | undefined {
-	if (!enabled) return undefined;
+function buildModeBadgeLine(theme: any, manifest: RunManifest | undefined, mode: SmalldoenMode): string | undefined {
+	if (mode === "off") return undefined;
 	const pills: string[] = [];
-	if (manifest && manifest.status === "active") {
+	if (mode === "orchestrate" && manifest && manifest.status === "active") {
 		const counts = packageCounts(manifest);
 		if (counts.failed > 0) pills.push(badge(theme, "error", `✗ ${counts.failed}`));
 		if (counts.running > 0) pills.push(badge(theme, "warning", `… ${counts.running}`));
@@ -531,18 +594,20 @@ function buildModeBadgeLine(theme: any, manifest: RunManifest | undefined, enabl
 		pills.push(badge(theme, "muted", effectiveStageLabel(manifest)));
 	}
 	pills.push(badge(theme, "accent", "ORCH"));
+	if (mode === "ask") pills.push(badge(theme, "muted", "ASK"));
+	if (mode === "brainstorm") pills.push(badge(theme, "muted", "BRAINSTORM"));
 	return pills.join(" ");
 }
 
-function applyRunVisualization(ctx: any, manifest: RunManifest | undefined, enabled: boolean): void {
+function applyRunVisualization(ctx: any, manifest: RunManifest | undefined, mode: SmalldoenMode): void {
 	if (!ctx.hasUI) return;
-	if (!enabled) {
+	if (mode === "off") {
 		ctx.ui.setWidget(SMALLDOEN_RUN_WIDGET_KEY, undefined);
 		return;
 	}
 	ctx.ui.setWidget(SMALLDOEN_RUN_WIDGET_KEY, (_tui: any, theme: any) => ({
 		render(width: number): string[] {
-			const line = buildModeBadgeLine(theme, manifest, enabled);
+			const line = buildModeBadgeLine(theme, manifest, mode);
 			return line ? [rightAlign(line, width)] : [];
 		},
 		invalidate() {},
@@ -554,19 +619,24 @@ function setActiveRun(manifest: RunManifest | undefined): void {
 }
 
 async function refreshRunVisualization(ctx: any): Promise<void> {
-	if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) {
+	if (!isTopLevelSmalldoenModeEnabled(modeState.mode)) {
 		setActiveRun(undefined);
-		applyRunVisualization(ctx, undefined, false);
+		applyRunVisualization(ctx, undefined, "off");
+		return;
+	}
+	if (modeState.mode !== "orchestrate") {
+		setActiveRun(undefined);
+		applyRunVisualization(ctx, undefined, modeState.mode);
 		return;
 	}
 	if (!activeRunId) {
-		applyRunVisualization(ctx, undefined, true);
+		applyRunVisualization(ctx, undefined, modeState.mode);
 		return;
 	}
 	const manifest = await loadRunManifest(ctx.cwd, activeRunId);
 	const activeManifest = manifest?.status === "active" ? manifest : undefined;
 	setActiveRun(activeManifest);
-	applyRunVisualization(ctx, activeManifest, true);
+	applyRunVisualization(ctx, activeManifest, modeState.mode);
 }
 
 function getDefaultConfigExamplePath(): string {
@@ -610,6 +680,63 @@ function effectiveStageLabel(manifest: RunManifest): string {
 async function writeReport(filePath: string, content: string): Promise<void> {
 	await fs.mkdir(path.dirname(filePath), { recursive: true });
 	await fs.writeFile(filePath, content, "utf8");
+}
+
+async function resolvePlanIdeaPath(cwd: string, title: string, requestedSlug?: string): Promise<{ slug: string; filePath: string }> {
+	const ideasDir = getSmalldoenPaths(cwd).ideasDir;
+	const baseSlug = slugifyFeatureName(requestedSlug?.trim() || title);
+	let slug = baseSlug;
+	let filePath = path.join(ideasDir, `${slug}.md`);
+	let counter = 2;
+	while (true) {
+		try {
+			await fs.access(filePath);
+			slug = `${baseSlug}-${counter}`;
+			filePath = path.join(ideasDir, `${slug}.md`);
+			counter += 1;
+		} catch {
+			return { slug, filePath };
+		}
+	}
+}
+
+function renderPlanIdeaMarkdown(
+	input: Omit<PlanIdeaDetails, "path"> & {
+		summary: string;
+		problem?: string;
+		users?: string[];
+		goals?: string[];
+		nonGoals?: string[];
+		coreFlows?: string[];
+		scope?: string[];
+		successCriteria?: string[];
+	},
+): string {
+	const quote = (value: string) => JSON.stringify(value);
+	const lines = [
+		"---",
+		`title: ${quote(input.title)}`,
+		`slug: ${quote(input.slug)}`,
+		`created_at: ${quote(input.createdAt)}`,
+		`source_mode: ${quote("brainstorm")}`,
+		"---",
+		"",
+		`# Let's build ${input.title}`,
+		"",
+		input.summary.trim(),
+	];
+	const pushSection = (heading: string, value?: string[]) => {
+		if (!value || value.length === 0) return;
+		lines.push("", heading, ...value.map((item) => `- ${item}`));
+	};
+	if (input.problem?.trim()) lines.push("", "## Why this matters", "", input.problem.trim());
+	pushSection("## Who this is for", input.users);
+	pushSection("## Goals", input.goals);
+	pushSection("## Non-goals", input.nonGoals);
+	pushSection("## Core flows", input.coreFlows);
+	pushSection("## Scope for the first build", input.scope);
+	pushSection("## Success criteria", input.successCriteria);
+	return `${lines.join("\n")}\n`;
 }
 
 async function loadRunManifestRequired(cwd: string, runId: string): Promise<RunManifest> {
@@ -789,38 +916,69 @@ function renderManageRunResult(details: ManageRunDetails, expanded: boolean, the
 	return new Text(lines, 0, 0);
 }
 
-async function applyConfiguredOrchestratorModel(pi: ExtensionAPI, ctx: any, state: OrchestrationModeState): Promise<void> {
-	const spec = getConfiguredModelSpec(ctx.cwd, "orchestrator");
-	if (!spec) return;
+function parseModelSpec(spec: string): { provider: string; modelId: string } | undefined {
 	const [provider, ...rest] = spec.split("/");
 	const modelId = rest.join("/");
-	if (!provider || !modelId) return;
-	if (ctx.model?.provider === provider && ctx.model?.id === modelId) return;
+	return provider && modelId ? { provider, modelId } : undefined;
+}
+
+async function applyModelSpec(
+	pi: ExtensionAPI,
+	ctx: any,
+	state: OrchestrationModeState,
+	spec: string,
+	messages: { notFound: string; missingAuth: string },
+): Promise<void> {
+	const parsed = parseModelSpec(spec);
+	if (!parsed) return;
+	if (ctx.model?.provider === parsed.provider && ctx.model?.id === parsed.modelId) return;
 	if (!state.previousModelSpec && ctx.model?.provider && ctx.model?.id) {
 		state.previousModelSpec = `${ctx.model.provider}/${ctx.model.id}`;
 	}
-	const model = ctx.modelRegistry.find(provider, modelId);
+	const model = ctx.modelRegistry.find(parsed.provider, parsed.modelId);
 	if (!model) {
-		ctx.ui.notify(`Configured orchestrator model not found: ${spec}`, "warning");
+		ctx.ui.notify(messages.notFound, "warning");
 		return;
 	}
 	const success = await pi.setModel(model);
-	if (!success) ctx.ui.notify(`No credentials for orchestrator model: ${spec}`, "warning");
+	if (!success) ctx.ui.notify(messages.missingAuth, "warning");
+}
+
+async function applyTopLevelModeModel(pi: ExtensionAPI, ctx: any, state: OrchestrationModeState): Promise<void> {
+	if (state.mode === "orchestrate") {
+		const spec = getConfiguredModelSpec(ctx.cwd, "orchestrator");
+		if (!spec) return;
+		await applyModelSpec(pi, ctx, state, spec, {
+			notFound: `Configured orchestrator model not found: ${spec}`,
+			missingAuth: `No credentials for orchestrator model: ${spec}`,
+		});
+		return;
+	}
+	if (state.mode === "ask" || state.mode === "brainstorm") {
+		const modeLabel = state.mode === "ask" ? "Ask" : "Brainstorm";
+		await applyModelSpec(pi, ctx, state, DISCOVERY_MODE_DEFAULT_MODEL_SPEC, {
+			notFound: `${modeLabel} mode default model not found: ${DISCOVERY_MODE_DEFAULT_MODEL_SPEC}`,
+			missingAuth: `No credentials for ${modeLabel.toLowerCase()} mode default model: ${DISCOVERY_MODE_DEFAULT_MODEL_SPEC}`,
+		});
+	}
 }
 
 async function restorePreviousModel(pi: ExtensionAPI, ctx: any, state: OrchestrationModeState): Promise<void> {
 	const spec = state.previousModelSpec;
 	if (!spec) return;
-	const [provider, ...rest] = spec.split("/");
-	const modelId = rest.join("/");
-	if (provider && modelId) {
-		const model = ctx.modelRegistry.find(provider, modelId);
-		if (model) await pi.setModel(model);
+	const parsed = parseModelSpec(spec);
+	if (!parsed) {
+		state.previousModelSpec = undefined;
+		return;
 	}
+	const model = ctx.modelRegistry.find(parsed.provider, parsed.modelId);
+	if (model) await pi.setModel(model);
 	state.previousModelSpec = undefined;
 }
 
-async function buildOrchestratorPrompt(cwd: string): Promise<string> {
+async function buildOrchestratorPrompt(cwd: string, mode: SmalldoenMode): Promise<string> {
+	if (mode === "ask") return ASK_MODE_RUNTIME_PROMPT.trim();
+	if (mode === "brainstorm") return BRAINSTORM_MODE_RUNTIME_PROMPT.trim();
 	const agent = getAgentConfig(cwd, "orchestrator");
 	const prompt = agent?.systemPrompt?.trim();
 	return [ORCHESTRATOR_RUNTIME_PROMPT.trim(), prompt].filter(Boolean).join("\n\n");
@@ -885,7 +1043,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		restoreCommitsModel(ctx);
 		restoreSubagentLogsMode(ctx);
 		syncTopLevelTools(pi);
-		if (modeState.enabled && !runtimeRole) await applyConfiguredOrchestratorModel(pi, ctx, modeState);
+		if (modeState.mode !== "off" && !runtimeRole) await applyTopLevelModeModel(pi, ctx, modeState);
 		setActiveRun(undefined);
 		await refreshRunVisualization(ctx);
 	});
@@ -896,15 +1054,17 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		restoreCommitsModel(ctx);
 		restoreSubagentLogsMode(ctx);
 		syncTopLevelTools(pi);
-		if (modeState.enabled && !runtimeRole) await applyConfiguredOrchestratorModel(pi, ctx, modeState);
+		if (modeState.mode !== "off" && !runtimeRole) await applyTopLevelModeModel(pi, ctx, modeState);
 		setActiveRun(undefined);
 		await refreshRunVisualization(ctx);
 	});
 
 	pi.on("input", async (event, ctx) => {
-		if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) return { action: "continue" as const };
+		if (!isTopLevelSmalldoenModeEnabled(modeState.mode)) return { action: "continue" as const };
 		const text = event.text.trim();
 		if (!text) return { action: "continue" as const };
+		if (text.startsWith("/orch")) return { action: "continue" as const };
+		if (modeState.mode !== "orchestrate") return { action: "continue" as const };
 		const allowedWithoutConfig = ["/orch", "/reload", "/smalldoen-status", "/subagent-logs"];
 		if (!hasSmalldoenConfig(ctx.cwd)) {
 			if (!allowedWithoutConfig.some((command) => text === command || text.startsWith(`${command} `))) {
@@ -914,28 +1074,27 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			}
 			return { action: "continue" as const };
 		}
-		if (text.startsWith("/orch")) return { action: "continue" as const };
 		if (!activeRunId) return { action: "continue" as const };
 		const manifest = await loadRunManifest(ctx.cwd, activeRunId);
 		if (manifest && manifest.status === "active") {
 			const stale = await markRunStale(ctx.cwd, manifest, `Superseded by new user input: ${event.text.trim().slice(0, 200)}`);
 			await appendRunEvent(ctx.cwd, stale, "run_stale", "Run marked stale because a new user instruction interrupted the workflow.");
 			setActiveRun(undefined);
-			applyRunVisualization(ctx, stale, true);
+			applyRunVisualization(ctx, stale, modeState.mode);
 		}
 		if (!ctx.isIdle()) ctx.abort();
 		return { action: "continue" as const };
 	});
 
 	pi.registerCommand("orch", {
-		description: "Control orchestration mode (toggle|on|off|status|implement|continue|review|summary)",
+		description: "Control smalldoen modes (toggle|on|ask|brainstorm|off|status|implement|continue|review|summary)",
 		getArgumentCompletions: getOrchArgumentCompletions,
 		handler: async (args, ctx) => {
 			const rawArgs = (args || "").trim();
 			const spaceIndex = rawArgs.indexOf(" ");
 			const command = (spaceIndex === -1 ? rawArgs : rawArgs.slice(0, spaceIndex)).toLowerCase();
 			const commandArgs = spaceIndex === -1 ? "" : rawArgs.slice(spaceIndex + 1).trim();
-			const current = getOrchestrationMode(modeState);
+			const current = getSmalldoenMode(modeState);
 			if (!ORCH_KNOWN_COMMANDS.has(command)) {
 				ctx.ui.notify(ORCH_USAGE, "warning");
 				return;
@@ -983,23 +1142,25 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 				ctx.ui.notify(`Listed ${files.length} saved summary file(s).`, "info");
 				return;
 			}
-			if ((command === "" || command === "toggle" || command === "off") && !ctx.isIdle()) ctx.abort();
-			let next = current;
-			if (command === "on") next = true;
-			else if (command === "off") next = false;
+			if ((command === "" || command === "toggle" || command === "on" || command === "ask" || command === "brainstorm" || command === "off") && !ctx.isIdle()) ctx.abort();
+			let next: SmalldoenMode = current;
+			if (command === "on") next = "orchestrate";
+			else if (command === "ask") next = "ask";
+			else if (command === "brainstorm") next = "brainstorm";
+			else if (command === "off") next = "off";
 			else next = toggleOrchestrationMode(pi, ctx, modeState);
-			if (command === "on" || command === "off") setOrchestrationMode(pi, ctx, modeState, next);
+			if (command === "on" || command === "ask" || command === "brainstorm" || command === "off") setOrchestrationMode(pi, ctx, modeState, next);
 			if (!runtimeRole) {
-				if (next) await applyConfiguredOrchestratorModel(pi, ctx, modeState);
+				if (next !== "off") await applyTopLevelModeModel(pi, ctx, modeState);
 				else await restorePreviousModel(pi, ctx, modeState);
 			}
 			syncTopLevelTools(pi);
 			ctx.ui.notify(describeMode(next), "info");
-			if (next && !hasSmalldoenConfig(ctx.cwd)) {
+			if (next === "orchestrate" && !hasSmalldoenConfig(ctx.cwd)) {
 				const guidance = buildMissingConfigGuidance(ctx.cwd);
 				ctx.ui.notify(guidance.message, "warning");
 			}
-			if (!current && next) setActiveRun(undefined);
+			if (current !== next && next !== "orchestrate") setActiveRun(undefined);
 			await refreshRunVisualization(ctx);
 		},
 	});
@@ -1013,7 +1174,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 				return;
 			}
 			ctx.ui.setEditorText(formatManifestSummary(manifest));
-			applyRunVisualization(ctx, manifest, modeState.enabled);
+			applyRunVisualization(ctx, manifest, modeState.mode);
 			ctx.ui.notify(`Loaded status for ${manifest.runId}`, "info");
 		},
 	});
@@ -1048,7 +1209,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 	pi.registerCommand("commits", {
 		description: "Commit current project changes in /orch mode. Use /commits model to pick the commit-message model.",
 		handler: async (args, ctx) => {
-			if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) {
+			if (!isTopLevelOrchestrationModeEnabled(modeState.mode)) {
 				ctx.ui.notify("/commits is available only when /orch mode is enabled.", "warning");
 				return;
 			}
@@ -1221,8 +1382,8 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			promptGuidelines: ["Use this tool when a framework or library behavior needs fresh documentation validation."],
 			parameters: DocsLookupParams,
 			async execute(_toolCallId, params) {
-				if (!runtimeRole && !isTopLevelOrchestrationModeEnabled(modeState.enabled)) {
-					throw new Error("docs_lookup is available only in /orch mode or to the scout child role.");
+				if (!runtimeRole && !isTopLevelSmalldoenModeEnabled(modeState.mode)) {
+					throw new Error("docs_lookup is available only when a smalldoen top-level mode is enabled or to the scout child role.");
 				}
 				if (!params.url && !params.query) throw new Error("Provide either url or query.");
 				const result = params.url ? await fetchUrl(params.url) : await searchDocs(params.query!);
@@ -1241,6 +1402,60 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 
 	if (!runtimeRole) {
 		pi.registerTool({
+			name: SAVE_PLAN_IDEA_TOOL_NAME,
+			label: "Save Plan Idea",
+			description: "Write a brainstormed plan idea to .pi/smalldoen/ideas/. Use this only after the user explicitly says the brainstorm is done or asks you to save the idea.",
+			promptSnippet: "Save the finalized brainstorm as a plan idea artifact.",
+			promptGuidelines: [
+				"Use this only in brainstorm mode.",
+				"Use it only after the user explicitly says the brainstorm is done or explicitly asks to write or save the plan idea.",
+				"Write the idea as a collaborative build brief, not a second-person recap.",
+			],
+			parameters: SavePlanIdeaParams,
+			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+				if (modeState.mode !== "brainstorm") throw new Error("save_plan_idea is available only when /orch brainstorm mode is enabled.");
+				const createdAt = new Date().toISOString();
+				const target = await resolvePlanIdeaPath(ctx.cwd, params.title, params.slug);
+				const markdown = renderPlanIdeaMarkdown({
+					title: params.title.trim(),
+					slug: target.slug,
+					createdAt,
+					summary: params.summary.trim(),
+					problem: params.problem?.trim() || undefined,
+					users: params.users?.map((value) => value.trim()).filter(Boolean),
+					goals: params.goals?.map((value) => value.trim()).filter(Boolean),
+					nonGoals: params.nonGoals?.map((value) => value.trim()).filter(Boolean),
+					coreFlows: params.coreFlows?.map((value) => value.trim()).filter(Boolean),
+					scope: params.scope?.map((value) => value.trim()).filter(Boolean),
+					successCriteria: params.successCriteria?.map((value) => value.trim()).filter(Boolean),
+				});
+				await writeReport(target.filePath, markdown);
+				const details: PlanIdeaDetails = {
+					title: params.title.trim(),
+					slug: target.slug,
+					path: target.filePath,
+					createdAt,
+				};
+				return {
+					content: [{ type: "text", text: [`Plan idea saved`, `Title: ${details.title}`, `Path: ${relativePath(ctx.cwd, details.path) ?? details.path}`].join("\n") }],
+					details,
+				};
+			},
+			renderCall(args, theme) {
+				return new Text(`${theme.fg("toolTitle", theme.bold("Saving "))}${theme.fg("accent", "[PLAN_IDEA]")} ${theme.fg("toolOutput", args.title ?? "idea")}`, 0, 0);
+			},
+			renderResult(result, _options, theme) {
+				const details = result.details as PlanIdeaDetails | undefined;
+				if (!details) return new Text(result.content[0]?.type === "text" ? result.content[0].text : "(no output)", 0, 0);
+				return new Text([
+					theme.fg("success", "✓"),
+					theme.fg("toolOutput", details.title),
+					theme.fg("dim", details.path),
+				].join("  "), 0, 0);
+			},
+		});
+
+		pi.registerTool({
 			name: MANAGE_RUN_TOOL_NAME,
 			label: "Manage Run",
 			description: "Create or update the live orchestration run artifact. Use this to start runs, change stages, track package progress, store review outcomes, and finish runs.",
@@ -1251,7 +1466,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			],
 			parameters: ManageRunParams,
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-				if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) throw new Error("manage_run is available only when /orch mode is enabled.");
+				if (!isTopLevelOrchestrationModeEnabled(modeState.mode)) throw new Error("manage_run is available only when /orch mode is enabled.");
 				ensureConfigPresent(ctx.cwd);
 
 				if (params.action === "start") {
@@ -1270,7 +1485,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 					});
 					manifest = await appendRunEvent(ctx.cwd, manifest, "run_start", `Started orchestration run for ${params.feature}`);
 					setActiveRun(manifest);
-					applyRunVisualization(ctx, manifest, true);
+					applyRunVisualization(ctx, manifest, modeState.mode);
 					const details = buildManageRunDetails("start", manifest);
 					return {
 						content: [{ type: "text", text: `Run started\nRun ID: ${manifest.runId}\nFeature: ${manifest.feature}\nStage: ${manifest.stage}` }],
@@ -1283,7 +1498,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 
 				if (params.action === "status") {
 					setActiveRun(manifest);
-					applyRunVisualization(ctx, manifest, true);
+					applyRunVisualization(ctx, manifest, modeState.mode);
 					return { content: [{ type: "text", text: formatManifestSummary(manifest) }], details: buildManageRunDetails("status", manifest) };
 				}
 
@@ -1298,7 +1513,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 					}
 					if (params.note?.trim()) nextManifest = await appendRunEvent(ctx.cwd, nextManifest, "stage_change", params.note.trim(), { stage: params.stage.trim(), planPath });
 					setActiveRun(nextManifest);
-					applyRunVisualization(ctx, nextManifest, true);
+					applyRunVisualization(ctx, nextManifest, modeState.mode);
 					return { content: [{ type: "text", text: formatManifestSummary(nextManifest) }], details: buildManageRunDetails("stage", nextManifest) };
 				}
 
@@ -1317,7 +1532,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 						changedFiles: params.changedFiles,
 					});
 					setActiveRun(nextManifest);
-					applyRunVisualization(ctx, nextManifest, true);
+					applyRunVisualization(ctx, nextManifest, modeState.mode);
 					return {
 						content: [{ type: "text", text: formatManifestSummary(nextManifest) }],
 						details: buildManageRunDetails("package", nextManifest, { packageId: params.packageId.trim() }),
@@ -1344,7 +1559,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 						reportPath,
 					});
 					setActiveRun(nextManifest);
-					applyRunVisualization(ctx, nextManifest, true);
+					applyRunVisualization(ctx, nextManifest, modeState.mode);
 					return { content: [{ type: "text", text: formatManifestSummary(nextManifest) }], details: buildManageRunDetails("review", nextManifest) };
 				}
 
@@ -1361,7 +1576,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 						nextManifest = await updateRunManifest(ctx.cwd, nextManifest, { summaryPath });
 					}
 					setActiveRun(nextManifest.status === "active" ? nextManifest : undefined);
-					applyRunVisualization(ctx, nextManifest, true);
+					applyRunVisualization(ctx, nextManifest, modeState.mode);
 					return { content: [{ type: "text", text: formatManifestSummary(nextManifest) }], details: buildManageRunDetails("finish", nextManifest) };
 				}
 
@@ -1390,7 +1605,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			],
 			parameters: InspectPlanParams,
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-				if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) throw new Error("inspect_plan is available only when /orch mode is enabled.");
+				if (!isTopLevelOrchestrationModeEnabled(modeState.mode)) throw new Error("inspect_plan is available only when /orch mode is enabled.");
 				ensureConfigPresent(ctx.cwd);
 				const explicitPlanPath = resolveOptionalUserPath(ctx.cwd, params.planPath);
 				let planPath = explicitPlanPath;
@@ -1436,7 +1651,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			],
 			parameters: DelegateParams,
 			async execute(_toolCallId, params, signal, onUpdate, ctx) {
-				if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) throw new Error("delegate is available only when /orch mode is enabled.");
+				if (!isTopLevelOrchestrationModeEnabled(modeState.mode)) throw new Error("delegate is available only when /orch mode is enabled.");
 				ensureConfigPresent(ctx.cwd);
 
 				const configuredRoleModel = getConfiguredModelSpec(ctx.cwd, params.role as WorkerRole);
@@ -1472,7 +1687,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 						packageId: params.packageId,
 					});
 					setActiveRun(manifest);
-					applyRunVisualization(ctx, manifest, true);
+					applyRunVisualization(ctx, manifest, modeState.mode);
 				}
 
 				try {
@@ -1524,7 +1739,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 							reportPath: details.reportPath,
 						});
 						setActiveRun(manifest);
-						applyRunVisualization(ctx, manifest, true);
+						applyRunVisualization(ctx, manifest, modeState.mode);
 					}
 
 					return {
@@ -1563,7 +1778,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 							error: error instanceof Error ? error.message : String(error),
 						});
 						setActiveRun(manifest);
-						applyRunVisualization(ctx, manifest, true);
+						applyRunVisualization(ctx, manifest, modeState.mode);
 					}
 					throw error;
 				}
@@ -1581,9 +1796,14 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 	}
 
 	pi.on("before_agent_start", async (event, ctx) => {
-		if (!isTopLevelOrchestrationModeEnabled(modeState.enabled)) return;
+		if (!isTopLevelSmalldoenModeEnabled(modeState.mode)) return;
+		const orchestratorPrompt = await buildOrchestratorPrompt(ctx.cwd, modeState.mode);
+		if (modeState.mode !== "orchestrate") {
+			return {
+				systemPrompt: `${event.systemPrompt}\n\n${orchestratorPrompt}`,
+			};
+		}
 		const orchestratorMemory = await buildRoleMemoryContext("orchestrator", ctx.cwd);
-		const orchestratorPrompt = await buildOrchestratorPrompt(ctx.cwd);
 		const hookContent = await buildAgentHookContent(ctx.cwd);
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${orchestratorPrompt}${orchestratorMemory ? `\n\n${orchestratorMemory}` : ""}${hookContent ? `\n\nProject-local hook:\n${hookContent}` : ""}`,
@@ -1596,7 +1816,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 		if (event.toolName === "write" || event.toolName === "edit") {
 			const inputPath = (event.input as { path?: string } | undefined)?.path;
 			if (!inputPath) return;
-			if (role === "orchestrator") return { block: true, reason: "Orchestrator is read-only in /orch mode." };
+			if (role === "orchestrator") return { block: true, reason: "Orchestrator is read-only in smalldoen top-level modes." };
 			if (role === "planner" && !assertPlannerPathAllowed(ctx.cwd, inputPath)) return { block: true, reason: "Planner may only write under .pi/smalldoen/plans/." };
 			if ((role === "scout" || role === "reviewer") && !assertArtifactPathAllowed(role, ctx.cwd, inputPath)) {
 				return { block: true, reason: `${role} may only write project artifacts under .pi/smalldoen/reports/ or .pi/smalldoen/memory/${role}/.` };

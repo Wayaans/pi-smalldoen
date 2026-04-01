@@ -1,274 +1,149 @@
 # pi-smalldoen
 
-A project-local orchestration package for [pi](https://www.npmjs.com/package/@mariozechner/pi-coding-agent).
+Project-local orchestration for [pi](https://www.npmjs.com/package/@mariozechner/pi-coding-agent).
 
-`pi-smalldoen` turns pi into a structured development workflow with specialized roles instead of one undifferentiated coding agent.
+It adds a visible top-level **orchestrator** plus specialized child roles:
+- **scout** — repo and docs discovery
+- **planner** — versioned plans
+- **engineer** — code work
+- **designer** — UI work
+- **reviewer** — review pass
 
-It adds an opt-in orchestration mode with:
-- **orchestrator** — top-level controller
-- **scout** — codebase and docs validation
-- **planner** — versioned implementation plans
-- **engineer** — logic and code execution
-- **designer** — UI, UX, and frontend execution
-- **reviewer** — direct review of changed and affected files
-
-Everything stays project-local under `.pi/`.
-
-## Why use this
-
-Use `pi-smalldoen` when you want pi to behave more like a disciplined personal development workflow:
-
-- planning before implementation
-- optional discovery before planning
-- implementation split into work packages
-- parallel execution only when safe
-- review and repair loops
-- per-role model/provider config
-- project-local memory, reports, and run manifests
-
-## Features
-
-- `/orch` toggle for orchestration mode
-- footer indicator: **Orchestration mode**
-- per-role prompt customization
-- per-role provider/model selection
-- project-local config via `.pi/smalldoen.json`
-- optional subagent trace and raw log capture
-- versioned plan files
-- visible orchestrator-led delegation flow
-- isolated child agents per role
-- package-based plan inspection and scheduling
-- live run widget and status tracking
-- `/commits` command for model-assisted git commits in `/orch` mode
-- project-local memory, reports, and run manifests
-- docs validation tool for orchestrator and scout
+All artifacts stay under `.pi/`.
 
 ## Install
 
-Install the package into the current project:
-
 ```bash
 pi install -l git@github.com:Wayaans/pi-smalldoen.git
-```
-
-Use `-l` so pi writes the package into project-local `.pi/settings.json`.
-
-Then reload pi:
-
-```bash
 /reload
 ```
 
 ## Quick start
 
-1. Install the package
-2. Create `.pi/smalldoen.json`
-3. Configure per-role models
-4. Start pi
-5. Enable orchestration mode:
+1. Create `.pi/smalldoen.json`
+2. Enable a mode
+3. Start working
 
-You can copy the packaged example first:
+Copy the packaged example if needed:
 
 ```bash
 mkdir -p .pi
 cp /absolute/path/to/@wayanary/pi-smalldoen/defaults/smalldoen.example.json .pi/smalldoen.json
 ```
 
-When the config file is missing, `/orch` prints the exact example path for your installation.
+Then use one of these:
 
 ```bash
 /orch on
+/orch ask
+/orch brainstorm
 ```
 
-Then ask for a full feature workflow.
+## Modes
 
-## Configuration
+### `/orch on`
+Full orchestration mode.
 
-Create this file in the target project:
+Top-level tools:
+- `manage_run`
+- `inspect_plan`
+- `delegate`
+- `docs_lookup`
 
-- `.pi/smalldoen.json`
+### `/orch ask`
+Direct, read-only Q&A mode.
 
-The packaged full example lives at `defaults/smalldoen.example.json` inside the installed package.
+Rules:
+- default model: `github-copilot/gpt-5.4-mini`
+- no `delegate`
+- no `manage_run`
+- no `inspect_plan`
+- no writing or implementation
+- can still inspect the repo read-only and use `docs_lookup`
 
-Minimal example:
+### `/orch brainstorm`
+Idea-refinement mode before implementation.
 
-```json
-{
-  "ui": {
-    "modeIndicatorText": "Orchestration mode"
-  },
-  "observability": {
-    "subagentLogs": "off"
-  },
-  "agents": {
-    "orchestrator": {
-      "provider": "github-copilot",
-      "model": "claude-opus-4.6"
-    },
-    "scout": {
-      "provider": "github-copilot",
-      "model": "gemini-3-pro"
-    },
-    "planner": {
-      "provider": "github-copilot",
-      "model": "claude-sonnet-4.5"
-    },
-    "engineer": {
-      "provider": "github-copilot",
-      "model": "claude-sonnet-4.5"
-    },
-    "designer": {
-      "provider": "github-copilot",
-      "model": "claude-sonnet-4.5"
-    },
-    "reviewer": {
-      "provider": "github-copilot",
-      "model": "claude-opus-4.6"
-    }
-  }
-}
-```
+Rules:
+- default model: `github-copilot/gpt-5.4-mini`
+- no `delegate`
+- no `manage_run`
+- no `inspect_plan`
+- no implementation
+- no file writing until the user explicitly says the brainstorm is done or asks to save the idea
+- can save a plan idea to `.pi/smalldoen/ideas/<slug>.md`
 
-## Prompt override order
+## Indicator
 
-For each role, prompt resolution order is:
+The footer keeps **ORCH** visible in all top-level modes.
 
-1. prompt path from `.pi/smalldoen.json`
-2. project override at `.pi/agents/<role>.md`
-3. packaged default prompt at `defaults/agents/<role>.md`
-
-This means the package works immediately after install, while projects can override only the roles they need.
-
-## Subagent logs
-
-Delegated subagents can write optional logs under:
-
-- `.pi/smalldoen/logs/`
-
-Configure the default mode in `.pi/smalldoen.json`:
-
-```json
-{
-  "observability": {
-    "subagentLogs": "off"
-  }
-}
-```
-
-Supported modes:
-
-- `off` — default, no extra log capture
-- `trace` — human-readable subagent trace log
-- `full` — trace log plus raw child JSONL and stderr log
-
-At runtime you can override the current session with:
-
-- `/subagent-logs on`
-- `/subagent-logs off`
-- `/subagent-logs trace`
-- `/subagent-logs full`
-- `/subagent-logs status`
-
-`/subagent-logs on` uses the configured mode when `.pi/smalldoen.json` sets `trace` or `full`. If the config default is `off`, it enables `trace` for the current session.
-
-## Role hooks
-
-When orchestration mode is active, the runtime looks for additive hook files in `.pi/smalldoen/hooks/`.
-
-These files do not replace the normal role prompt chain. The existing role prompt behavior stays the same:
-- `.pi/smalldoen.json` can point a role at a custom prompt
-- `.pi/agents/<role>.md` can override a role in the project
-- packaged defaults still act as the fallback
-
-Role hooks are appended at runtime to the effective system prompt after that normal resolution step. They are extra project-local guidance, not a new prompt source.
-
-If the `.pi/smalldoen/hooks/` directory does not exist, or if any hook file is missing, the runtime skips it silently.
-
-### Supported hook files
-
-| File | Loaded for |
-|------|------------|
-| `.pi/smalldoen/hooks/agent.md` | Top-level orchestrator only |
-| `.pi/smalldoen/hooks/subagent.md` | All delegated subagents |
-| `.pi/smalldoen/hooks/scout.md` | Scout subagent only |
-| `.pi/smalldoen/hooks/planner.md` | Planner subagent only |
-| `.pi/smalldoen/hooks/engineer.md` | Engineer subagent only |
-| `.pi/smalldoen/hooks/designer.md` | Designer subagent only |
-| `.pi/smalldoen/hooks/reviewer.md` | Reviewer subagent only |
-
-### Layering order
-
-- Top-level orchestrator: `agent.md`
-- Delegated subagents: `subagent.md`, then the matching role file such as `engineer.md` or `designer.md`
-
-When more than one hook applies, the runtime concatenates the non-empty files in that order and appends them as runtime guidance. The injected block is labeled `Project-local hook:`.
-
-## Available tools in orchestration mode
-
-When `/orch` mode is enabled, the top-level session can use:
-
-- `manage_run` — create and update the live orchestration run state
-- `inspect_plan` — parse a plan and inspect safe package groups
-- `delegate` — isolated child-role execution
-- `docs_lookup` — framework and library documentation validation
+Examples:
+- orchestration: `ORCH`
+- ask: `ORCH ASK`
+- brainstorm: `ORCH BRAINSTORM`
 
 ## Commands
 
 - `/orch`
 - `/orch on`
+- `/orch ask`
+- `/orch brainstorm`
 - `/orch off`
 - `/orch status`
 - `/smalldoen-status`
-- `/subagent-logs on`
-- `/subagent-logs off`
-- `/subagent-logs trace`
-- `/subagent-logs full`
-- `/subagent-logs status`
+- `/subagent-logs on|off|trace|full|status`
 - `/commits`
 - `/commits model`
 - `/commits model reset`
 
-## Commits command
+## Minimal config
 
-While `/orch` mode is active, run `/commits` to stage and commit the current project changes.
+```json
+{
+  "observability": {
+    "subagentLogs": "off"
+  },
+  "agents": {
+    "orchestrator": { "provider": "github-copilot", "model": "claude-opus-4.6" },
+    "scout": { "provider": "github-copilot", "model": "gemini-3-pro" },
+    "planner": { "provider": "github-copilot", "model": "claude-sonnet-4.5" },
+    "engineer": { "provider": "github-copilot", "model": "claude-sonnet-4.5" },
+    "designer": { "provider": "github-copilot", "model": "claude-sonnet-4.5" },
+    "reviewer": { "provider": "github-copilot", "model": "claude-opus-4.6" }
+  }
+}
+```
 
-The command generates a commit message with an auto-selected fast/cheap model by default, then lets you review the message before the commit is created.
+## Prompt overrides
 
-Use `/commits model` to choose a specific model for commit-message generation, or `/commits model reset` to go back to automatic model selection.
+Role prompt lookup order:
+1. prompt path from `.pi/smalldoen.json`
+2. `.pi/agents/<role>.md`
+3. packaged default in `defaults/agents/<role>.md`
 
-## Workflow
+Optional runtime hooks live in:
+- `.pi/smalldoen/hooks/agent.md`
+- `.pi/smalldoen/hooks/subagent.md`
+- `.pi/smalldoen/hooks/<role>.md`
 
-Typical full workflow:
+## Artifacts
 
-1. **orchestrator** starts and updates the run
-2. optional **scout** runs in an isolated child session
-3. **planner** writes a versioned plan
-4. **orchestrator** inspects the plan and chooses execution order
-5. **engineer/designer** run isolated work packages sequentially or in parallel only when safe
-6. **orchestrator** marks package progress and then starts **reviewer**
-7. **orchestrator** decides reroute, rescout, or replan if needed
-
-## Project-local artifacts
-
-By default, the package writes artifacts under:
-
+Default artifact paths:
 - `.pi/smalldoen/plans/`
 - `.pi/smalldoen/memory/`
 - `.pi/smalldoen/runs/`
 - `.pi/smalldoen/logs/`
 - `.pi/smalldoen/reports/scout/`
 - `.pi/smalldoen/reports/review/`
+- `.pi/smalldoen/ideas/`
 
-These can be overridden in `.pi/smalldoen.json`.
+## Notes
 
-## Limitations
-
-- package conflict detection is file-list based
-- changed-file extraction depends on worker output format
-- docs lookup is lightweight, not a full crawler
-- smoke testing in a real target project is strongly recommended before relying on it for important work
+- `/commits` works only in `/orch on`
+- `planner` is required before implementation in orchestration mode
+- subagent logs are optional
+- docs lookup is lightweight
 
 ## Safety
 
-This package runs extension code and child agents with your local permissions.
-Review the code before using it in sensitive repositories.
+This package runs with your local permissions. Review it before using it in sensitive repositories.
