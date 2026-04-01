@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import * as fsSync from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { complete, StringEnum } from "@mariozechner/pi-ai";
@@ -34,6 +35,7 @@ import {
 import {
 	ensureRuntimeLayout,
 	getReviewReportPath,
+	getRunSummaryPath,
 	getScoutReportPath,
 	getSmalldoenPaths,
 } from "./paths";
@@ -75,9 +77,42 @@ const runtimeRole = getRuntimeRole();
 let activeRunId: string | undefined;
 let commitsModelSpec: string | undefined;
 let subagentLogsOverride: SubagentLogMode | undefined;
+let runSummaryCwd: string | undefined;
 
 const SMALLDOEN_COMMITS_MODEL_ENTRY = "smalldoen-commits-model" as const;
 const SMALLDOEN_SUBAGENT_LOGS_ENTRY = "smalldoen-subagent-logs" as const;
+const ORCH_IMPLEMENT_TEMPLATE = `Use orchestration mode for this request.
+
+If orchestration mode is not enabled, tell me to run \`/orch\` first.
+
+Then act as the visible orchestrator and work step by step:
+- start a run with \`manage_run\`
+- decide whether scout is needed
+- delegate scout, planner, engineer, designer, and reviewer in isolated contexts with \`delegate\`
+- after planner finishes, use \`inspect_plan\` and decide the execution order yourself
+- run engineer/designer sequentially or in parallel only when the inspected plan says it is safe
+- update the run state with \`manage_run\` after each stage and package change
+- after all relevant packages are done, run reviewer
+- if reviewer fails, decide whether to reroute, rescout, or replan
+- keep the workflow visible: explain each major decision before you delegate
+- finish with a concise summary, changed files, plan path, run id, and review verdict`;
+const ORCH_CONTINUE_TEMPLATE = `Use orchestration mode for this request.
+
+If orchestration mode is not enabled, tell me to run \`/orch\` first.
+
+Continue work as the visible orchestrator:
+- load the latest run state with \`manage_run\` if one exists
+- if the feature already has a plan, create a new plan version instead of overwriting the old one
+- delegate scout or planner as needed in isolated contexts
+- inspect the resulting plan with \`inspect_plan\`
+- continue package execution and run-state updates step by step
+- keep the workflow visible by explaining each major delegation decision
+- finish with the updated run status, plan path, changed files, and review state`;
+const ORCH_REVIEW_TEMPLATE = `Use orchestration mode for this request.
+
+If orchestration mode is not enabled, tell me to run \`/orch\` first.
+
+Load the latest orchestration run state with \`manage_run\`, inspect the latest plan, and rerun the reviewer in an isolated context with \`delegate\`. Keep the review workflow visible, then return the verdict, critical issues, warnings, rerouting guidance, and updated run status.`;
 const COMMITS_SYSTEM_PROMPT = `You write concise, high-signal git commit messages.
 
 Rules:
@@ -779,6 +814,50 @@ async function buildOrchestratorPrompt(cwd: string): Promise<string> {
 	return [ORCHESTRATOR_RUNTIME_PROMPT.trim(), prompt].filter(Boolean).join("\n\n");
 }
 
+function setCommandInput(pi: ExtensionAPI, ctx: any, text: string): void {
+	const inputApi = pi as ExtensionAPI & { setInput?: (value: string) => void };
+	if (typeof inputApi.setInput === "function") inputApi.setInput(text);
+	else ctx.ui.setEditorText(text);
+}
+
+function countHistoricalRunsForSummary(): number {
+	if (!runSummaryCwd) return 1;
+	try {
+		const entries = fsSync.readdirSync(getSmalldoenPaths(runSummaryCwd).runsDir, { withFileTypes: true });
+		const count = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).length;
+		return count > 0 ? count : 1;
+	} catch {
+		return 1;
+	}
+}
+
+function buildRunSummary(manifest: RunManifest, note?: string): string {
+	const counts = packageCounts(manifest);
+	const historicalRunCount = countHistoricalRunsForSummary();
+	const subagentLines = manifest.subagents.length > 0
+		? [...manifest.subagents]
+			.sort((left, right) => left.updatedAt.localeCompare(right.updatedAt))
+			.map((subagent) => `- ${subagent.role}${subagent.label ? ` (${subagent.label})` : ""} — ${subagent.model ?? "unknown model"}`)
+		: ["- none recorded"];
+	const lines = [
+		`# ${manifest.feature}`,
+		"",
+		`- Objective: ${manifest.objective}`,
+		`- Run ID: ${manifest.runId}`,
+		`- Final status: ${manifest.status}`,
+		`- Historical run count: ${historicalRunCount}`,
+		"",
+		"## Subagents Used",
+		...subagentLines,
+		"",
+		"## Package Totals",
+		`- Completed: ${counts.completed}`,
+		`- Failed: ${counts.failed}`,
+	];
+	if (note?.trim()) lines.push("", "## Final Note", note.trim());
+	return lines.join("\n");
+}
+
 export default function smalldoenExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		await ensureRuntimeLayout(ctx.cwd);
@@ -829,18 +908,59 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("orch", {
-		description: "Toggle orchestration mode for this session (/orch, /orch on, /orch off, /orch status)",
+		description: "Control orchestration mode and load orchestration templates",
 		handler: async (args, ctx) => {
-			const command = (args || "").trim().toLowerCase();
+			const rawArgs = (args || "").trim();
+			const spaceIndex = rawArgs.indexOf(" ");
+			const command = (spaceIndex === -1 ? rawArgs : rawArgs.slice(0, spaceIndex)).toLowerCase();
+			const commandArgs = spaceIndex === -1 ? "" : rawArgs.slice(spaceIndex + 1).trim();
 			const current = getOrchestrationMode(modeState);
-			if (!["", "toggle", "on", "off", "status"].includes(command)) {
-				ctx.ui.notify("Usage: /orch, /orch on, /orch off, /orch status", "warning");
+			const knownCommands = ["", "toggle", "on", "off", "status", "implement", "continue", "review", "summary"];
+			if (!knownCommands.includes(command)) {
+				ctx.ui.notify("Usage: /orch [toggle|on|off|status|implement <description>|continue [context]|review|summary]", "warning");
 				return;
 			}
 			if (command === "status") {
 				ctx.ui.notify(describeMode(current), "info");
 				applyModeIndicator(ctx, current);
 				await refreshRunVisualization(ctx);
+				return;
+			}
+			if (command === "implement") {
+				const featureLine = commandArgs ? `\n\nFeature request: ${commandArgs}` : "";
+				setCommandInput(pi, ctx, `${ORCH_IMPLEMENT_TEMPLATE}${featureLine}`);
+				ctx.ui.notify("Loaded /orch implement template into the input.", "info");
+				return;
+			}
+			if (command === "continue") {
+				const extraLine = commandArgs ? `\n\nAdditional context: ${commandArgs}` : "";
+				setCommandInput(pi, ctx, `${ORCH_CONTINUE_TEMPLATE}${extraLine}`);
+				ctx.ui.notify("Loaded /orch continue template into the input.", "info");
+				return;
+			}
+			if (command === "review") {
+				setCommandInput(pi, ctx, ORCH_REVIEW_TEMPLATE);
+				ctx.ui.notify("Loaded /orch review template into the input.", "info");
+				return;
+			}
+			if (command === "summary") {
+				const summariesDir = getSmalldoenPaths(ctx.cwd).summariesDir;
+				let files: string[] = [];
+				try {
+					files = (await fs.readdir(summariesDir)).filter((file) => file.endsWith(".md")).sort().reverse();
+				} catch {
+					files = [];
+				}
+				if (files.length === 0) {
+					ctx.ui.notify("No saved run summaries found.", "info");
+					return;
+				}
+				ctx.ui.setEditorText([
+					`Saved run summaries (${files.length})`,
+					"",
+					...files.map((file) => `- ${relativePath(ctx.cwd, path.join(summariesDir, file)) ?? path.join(summariesDir, file)}`),
+				].join("\n"));
+				ctx.ui.notify(`Listed ${files.length} saved summary file(s).`, "info");
 				return;
 			}
 			if ((command === "" || command === "toggle" || command === "off") && !ctx.isIdle()) ctx.abort();
@@ -1091,7 +1211,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			renderCall(args, theme) {
 				return new Text(`${theme.fg("toolTitle", theme.bold("Looking up "))}${theme.fg("accent", "[DOCS_LOOKUP]")} ${theme.fg("toolOutput", args.url ?? args.query ?? "")}`, 0, 0);
 			},
-			renderResult(result, { expanded }, theme) {
+			renderResult(result, { expanded }, _theme) {
 				const text = result.content[0]?.type === "text" ? result.content[0].text : "(no output)";
 				if (!expanded) return new Text(text.split("\n").slice(0, 4).join("\n"), 0, 0);
 				return new Markdown(text, 0, 0, getMarkdownTheme());
@@ -1214,6 +1334,12 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 					if (finalStatus === "stale") nextManifest = await markRunStale(ctx.cwd, manifest, params.note?.trim() || "Marked stale.");
 					else nextManifest = await markRunFinished(ctx.cwd, manifest, finalStatus);
 					nextManifest = await appendRunEvent(ctx.cwd, nextManifest, "run_end", params.note?.trim() || `Run finished with status ${finalStatus}.`);
+					if (finalStatus === "completed") {
+						runSummaryCwd = ctx.cwd;
+						const summaryPath = getRunSummaryPath(ctx.cwd, nextManifest.runId);
+						await writeReport(summaryPath, buildRunSummary(nextManifest, params.note?.trim()));
+						nextManifest = await updateRunManifest(ctx.cwd, nextManifest, { summaryPath });
+					}
 					setActiveRun(nextManifest.status === "active" ? nextManifest : undefined);
 					applyRunVisualization(ctx, nextManifest, true);
 					return { content: [{ type: "text", text: formatManifestSummary(nextManifest) }], details: buildManageRunDetails("finish", nextManifest) };
@@ -1364,6 +1490,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 							label: details.label || details.role,
 							status: "completed",
 							packageId: details.packageId,
+							model: details.model || configuredRoleModel,
 							summary: summarizeText(details.finalOutput || "", 2),
 							traceLogPath: details.traceLogPath,
 							rawLogPath: details.rawLogPath,

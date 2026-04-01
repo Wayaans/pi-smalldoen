@@ -40,6 +40,7 @@ export interface RunSubagentState {
 	traceLogPath?: string;
 	rawLogPath?: string;
 	stderrLogPath?: string;
+	model?: string;
 	updatedAt: string;
 }
 
@@ -52,6 +53,7 @@ export interface RunManifest {
 	stage: string;
 	scoutUsed: boolean;
 	planPath?: string;
+	summaryPath?: string;
 	startedAt: string;
 	updatedAt: string;
 	reviewLoops: number;
@@ -119,6 +121,7 @@ export async function loadRunManifest(cwd: string, runId: string): Promise<RunMa
 			stage: parsed.stage ?? "intake",
 			scoutUsed: parsed.scoutUsed ?? false,
 			planPath: parsed.planPath,
+			summaryPath: parsed.summaryPath,
 			startedAt: parsed.startedAt ?? new Date().toISOString(),
 			updatedAt: parsed.updatedAt ?? new Date().toISOString(),
 			reviewLoops: parsed.reviewLoops ?? 0,
@@ -233,6 +236,7 @@ export function upsertSubagentState(
 		traceLogPath: input.traceLogPath ?? existing?.traceLogPath,
 		rawLogPath: input.rawLogPath ?? existing?.rawLogPath,
 		stderrLogPath: input.stderrLogPath ?? existing?.stderrLogPath,
+		model: input.model ?? existing?.model,
 		updatedAt,
 	};
 	manifest.subagents = [...manifest.subagents.filter((subagent) => subagent.key !== key), next]
