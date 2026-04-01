@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { complete, StringEnum } from "@mariozechner/pi-ai";
 import { BorderedLoader, getMarkdownTheme, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
+import { Container, Markdown, Spacer, Text, type AutocompleteItem } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { getAgentConfig } from "./agents";
 import { findProjectRoot, getConfiguredModelSpec, getConfiguredSubagentLogMode, getConfigPath, hasSmalldoenConfig } from "./config";
@@ -113,6 +113,18 @@ const ORCH_REVIEW_TEMPLATE = `Use orchestration mode for this request.
 If orchestration mode is not enabled, tell me to run \`/orch\` first.
 
 Load the latest orchestration run state with \`manage_run\`, inspect the latest plan, and rerun the reviewer in an isolated context with \`delegate\`. Keep the review workflow visible, then return the verdict, critical issues, warnings, rerouting guidance, and updated run status.`;
+const ORCH_USAGE = "Usage: /orch [toggle|on|off|status|implement <description>|continue [context]|review|summary]";
+const ORCH_SUBCOMMAND_COMPLETIONS: AutocompleteItem[] = [
+	{ value: "toggle", label: "toggle", description: "Toggle orchestration mode on or off." },
+	{ value: "on", label: "on", description: "Enable orchestration mode." },
+	{ value: "off", label: "off", description: "Disable orchestration mode." },
+	{ value: "status", label: "status", description: "Show whether orchestration mode is on or off." },
+	{ value: "implement ", label: "implement", description: "Load the implementation template. Continue typing the feature description." },
+	{ value: "continue ", label: "continue", description: "Load the continue template. Continue typing extra context." },
+	{ value: "review", label: "review", description: "Load the review template for the latest orchestration run." },
+	{ value: "summary", label: "summary", description: "List saved orchestration run summaries." },
+];
+const ORCH_KNOWN_COMMANDS = new Set(["", ...ORCH_SUBCOMMAND_COMPLETIONS.map((item) => item.label)]);
 const COMMITS_SYSTEM_PROMPT = `You write concise, high-signal git commit messages.
 
 Rules:
@@ -820,6 +832,14 @@ function setCommandInput(pi: ExtensionAPI, ctx: any, text: string): void {
 	else ctx.ui.setEditorText(text);
 }
 
+function getOrchArgumentCompletions(argumentPrefix: string): AutocompleteItem[] | null {
+	const normalizedPrefix = argumentPrefix.replace(/^\s+/, "");
+	if (/\s/.test(normalizedPrefix)) return null;
+	const query = normalizedPrefix.toLowerCase();
+	const matches = ORCH_SUBCOMMAND_COMPLETIONS.filter((item) => item.label.toLowerCase().startsWith(query));
+	return matches.length > 0 ? matches : null;
+}
+
 function countHistoricalRunsForSummary(): number {
 	if (!runSummaryCwd) return 1;
 	try {
@@ -908,16 +928,16 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("orch", {
-		description: "Control orchestration mode and load orchestration templates",
+		description: "Control orchestration mode (toggle|on|off|status|implement|continue|review|summary)",
+		getArgumentCompletions: getOrchArgumentCompletions,
 		handler: async (args, ctx) => {
 			const rawArgs = (args || "").trim();
 			const spaceIndex = rawArgs.indexOf(" ");
 			const command = (spaceIndex === -1 ? rawArgs : rawArgs.slice(0, spaceIndex)).toLowerCase();
 			const commandArgs = spaceIndex === -1 ? "" : rawArgs.slice(spaceIndex + 1).trim();
 			const current = getOrchestrationMode(modeState);
-			const knownCommands = ["", "toggle", "on", "off", "status", "implement", "continue", "review", "summary"];
-			if (!knownCommands.includes(command)) {
-				ctx.ui.notify("Usage: /orch [toggle|on|off|status|implement <description>|continue [context]|review|summary]", "warning");
+			if (!ORCH_KNOWN_COMMANDS.has(command)) {
+				ctx.ui.notify(ORCH_USAGE, "warning");
 				return;
 			}
 			if (command === "status") {
