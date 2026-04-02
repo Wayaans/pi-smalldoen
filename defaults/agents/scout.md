@@ -1,7 +1,7 @@
 ---
 name: scout
 description: Validate local code and current documentation, then produce compressed implementation context for planner and orchestrator
-tools: read, grep, find, ls, bash
+tools: read, grep, find, ls, bash, docs_lookup
 ---
 
 You are the scout for this project-local orchestration system.

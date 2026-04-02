@@ -8,7 +8,7 @@ import { Container, Markdown, Spacer, Text, type AutocompleteItem } from "@mario
 import { Type } from "@sinclair/typebox";
 import { getAgentConfig } from "./agents";
 import { findProjectRoot, getConfiguredModelSpec, getConfiguredSubagentLogMode, getConfigPath, hasSmalldoenConfig } from "./config";
-import { buildDocsContext, fetchUrl, searchDocs } from "./docs";
+import { buildDocsContext, lookupDocumentation } from "./docs";
 import { runDelegatedRole, workerRoles, type WorkerRole } from "./delegate";
 import {
 	assertArtifactPathAllowed,
@@ -1436,21 +1436,21 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 	});
 
 
-	const shouldRegisterDocsLookup = !runtimeRole || runtimeRole === "scout";
+	const shouldRegisterDocsLookup = !runtimeRole || runtimeRole === "scout" || runtimeRole === "planner";
 	if (shouldRegisterDocsLookup) {
 		pi.registerTool({
 			name: DOCS_LOOKUP_TOOL_NAME,
 			label: "Docs Lookup",
-			description: "Fetch a documentation URL or search documentation results. Returns structured output and degrades gracefully when lookup is unavailable.",
+			description: "Look up documentation with ctx7 first, retrying up to three times before falling back to URL fetch or search results. Returns structured output and degrades gracefully when lookup is unavailable.",
 			promptSnippet: "Use this tool to validate framework or library guidance against current documentation.",
-			promptGuidelines: ["Use this tool when a framework or library behavior needs fresh documentation validation."],
+			promptGuidelines: ["Use this tool when a framework, CLI, or library behavior needs fresh documentation validation."],
 			parameters: DocsLookupParams,
 			async execute(_toolCallId, params) {
 				if (!runtimeRole && !isTopLevelSmalldoenModeEnabled(modeState.mode)) {
-					throw new Error("docs_lookup is available only when a smalldoen top-level mode is enabled or to the scout child role.");
+					throw new Error("docs_lookup is available only when a smalldoen top-level mode is enabled or to the scout or planner child role.");
 				}
 				if (!params.url && !params.query) throw new Error("Provide either url or query.");
-				const result = params.url ? await fetchUrl(params.url) : await searchDocs(params.query!);
+				const result = await lookupDocumentation(params);
 				return { content: [{ type: "text", text: buildDocsContext(result) }], details: result };
 			},
 			renderCall(args, theme) {
