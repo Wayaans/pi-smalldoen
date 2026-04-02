@@ -123,7 +123,7 @@ const ORCH_SUBCOMMAND_COMPLETIONS: AutocompleteItem[] = [
 	{ value: "toggle", label: "toggle", description: "Toggle smalldoen mode on or off." },
 	{ value: "on", label: "on", description: "Enable orchestration mode." },
 	{ value: "ask", label: "ask", description: "Enable ask mode for direct, read-only answers without delegation." },
-	{ value: "brainstorm", label: "brainstorm", description: "Enable brainstorm mode for refining ideas before writing a plan idea." },
+	{ value: "brainstorm", label: "brainstorm", description: "Enable brainstorm mode for refining ideas into a concrete spec idea before implementation." },
 	{ value: "off", label: "off", description: "Disable smalldoen mode." },
 	{ value: "status", label: "status", description: "Show the current smalldoen mode." },
 	{ value: "implement ", label: "implement", description: "Load the implementation template. Continue typing the feature description." },
@@ -199,12 +199,20 @@ Hard rules:
 - Do not implement product code directly.
 - Do not use delegate, manage_run, or inspect_plan.
 - Do not create implementation plans.
-- Stay in brainstorming mode until the user explicitly says the brainstorming is done or explicitly asks you to write or save the plan idea.
+- Stay in brainstorming mode until the user explicitly says the brainstorming is done or explicitly asks you to write or save the spec idea.
 - Until that moment, do not write files.
-- Help the user turn rough thoughts into a concrete build idea by asking focused questions, surfacing tradeoffs, clarifying scope, and tightening goals, non-goals, and core flows.
-- Keep the discussion collaborative and concrete.
-- When the user explicitly asks you to write or save the plan idea, use save_plan_idea.
-- The resulting plan idea should read like a build brief in collaborative tone, for example "Let's build ...", not like a second-person summary such as "your idea is...".
+- Start by understanding the current project state. Inspect relevant files, docs, and nearby context before you refine the idea.
+- Assess scope early. If the request actually contains multiple independent subsystems, say so immediately, help decompose it into smaller spec ideas, and then brainstorm the first slice.
+- Ask one focused question per message. Prefer multiple-choice questions when they make the answer easier.
+- Focus on purpose, users, constraints, success criteria, non-goals, and the first realistic slice.
+- Once the idea is clear enough, propose 2-3 approaches with tradeoffs. Lead with your recommendation and explain why it fits best.
+- Do not jump from a rough idea to a vague summary. Make the design concrete: architecture, components, data flow, error handling, testing, scope, and success criteria.
+- Before presenting the design, ask if the user is ready for it. Then present it section by section and check whether each section looks right.
+- Use YAGNI. Prefer smaller, well-bounded units with clear interfaces and responsibilities.
+- Keep the discussion collaborative, concrete, and explanatory. Avoid bland one-line bullets, vague claims, and second-person recap.
+- When the user explicitly asks you to write or save the spec idea, use save_plan_idea.
+- The only file brainstorm mode produces is a SPEC_IDEA.
+- The resulting SPEC_IDEA should read like a collaborative build brief, for example "Let's build ...", and it should explain the recommendation, tradeoffs, and structure clearly.
 - You may use read, read-only bash commands, and docs_lookup when they help the brainstorm.
 `;
 
@@ -267,15 +275,25 @@ const DocsLookupParams = Type.Object({
 });
 
 const SavePlanIdeaParams = Type.Object({
-	title: Type.String({ description: "Short name for the idea." }),
-	summary: Type.String({ description: "A concise collaborative idea statement written like a build brief, not a second-person recap." }),
+	title: Type.String({ description: "Short name for the spec idea." }),
+	summary: Type.String({ description: "A short collaborative build brief in 1-3 paragraphs. Explain what we are building, why it matters, and what the first version should prove." }),
 	problem: Type.Optional(Type.String({ description: "Problem, opportunity, or motivation behind the idea." })),
 	users: Type.Optional(Type.Array(Type.String({ description: "Primary users or audiences." }))),
 	goals: Type.Optional(Type.Array(Type.String({ description: "What this idea should achieve." }))),
 	nonGoals: Type.Optional(Type.Array(Type.String({ description: "What is intentionally out of scope." }))),
+	recommendedApproach: Type.Optional(Type.String({ description: "Recommended approach and why it is the best fit." })),
+	alternatives: Type.Optional(Type.Array(Type.String({ description: "Alternative approaches and their tradeoffs." }))),
+	architecture: Type.Optional(Type.Array(Type.String({ description: "Major architectural decisions and boundaries." }))),
+	components: Type.Optional(Type.Array(Type.String({ description: "Main components or units, each with a clear purpose." }))),
 	coreFlows: Type.Optional(Type.Array(Type.String({ description: "Key user flows, capabilities, or experiences." }))),
+	dataFlow: Type.Optional(Type.Array(Type.String({ description: "How data or requests move through the system." }))),
+	errorHandling: Type.Optional(Type.Array(Type.String({ description: "Important failure cases and how the system should respond." }))),
+	testing: Type.Optional(Type.Array(Type.String({ description: "How the idea should be tested or validated." }))),
 	scope: Type.Optional(Type.Array(Type.String({ description: "Concrete scope items for the first build." }))),
 	successCriteria: Type.Optional(Type.Array(Type.String({ description: "Signals that the idea works well." }))),
+	risks: Type.Optional(Type.Array(Type.String({ description: "Main risks, dependencies, or sharp edges." }))),
+	openQuestions: Type.Optional(Type.Array(Type.String({ description: "Questions that still need answers." }))),
+	followUpSlices: Type.Optional(Type.Array(Type.String({ description: "Follow-up sub-projects or later slices if the broader idea should be decomposed." }))),
 	slug: Type.Optional(Type.String({ description: "Optional custom file slug. Defaults to a slugified title." })),
 });
 
@@ -724,9 +742,19 @@ function renderPlanIdeaMarkdown(
 		users?: string[];
 		goals?: string[];
 		nonGoals?: string[];
+		recommendedApproach?: string;
+		alternatives?: string[];
+		architecture?: string[];
+		components?: string[];
 		coreFlows?: string[];
+		dataFlow?: string[];
+		errorHandling?: string[];
+		testing?: string[];
 		scope?: string[];
 		successCriteria?: string[];
+		risks?: string[];
+		openQuestions?: string[];
+		followUpSlices?: string[];
 	},
 ): string {
 	const quote = (value: string) => JSON.stringify(value);
@@ -736,23 +764,41 @@ function renderPlanIdeaMarkdown(
 		`slug: ${quote(input.slug)}`,
 		`created_at: ${quote(input.createdAt)}`,
 		`source_mode: ${quote("brainstorm")}`,
+		`artifact_type: ${quote("SPEC_IDEA")}`,
 		"---",
 		"",
-		`# Let's build ${input.title}`,
+		`# SPEC_IDEA: ${input.title}`,
+		"",
+		"## Summary",
 		"",
 		input.summary.trim(),
 	];
-	const pushSection = (heading: string, value?: string[]) => {
-		if (!value || value.length === 0) return;
-		lines.push("", heading, ...value.map((item) => `- ${item}`));
+	const pushParagraphSection = (heading: string, value?: string) => {
+		if (!value?.trim()) return;
+		lines.push("", heading, "", value.trim());
 	};
-	if (input.problem?.trim()) lines.push("", "## Why this matters", "", input.problem.trim());
+	const pushSection = (heading: string, value?: string[]) => {
+		const items = value?.map((item) => item.trim()).filter(Boolean);
+		if (!items || items.length === 0) return;
+		lines.push("", heading, ...items.map((item) => `- ${item}`));
+	};
+	pushParagraphSection("## Why this matters", input.problem);
 	pushSection("## Who this is for", input.users);
 	pushSection("## Goals", input.goals);
 	pushSection("## Non-goals", input.nonGoals);
+	pushParagraphSection("## Recommended approach", input.recommendedApproach);
+	pushSection("## Alternatives considered", input.alternatives);
+	pushSection("## Architecture", input.architecture);
+	pushSection("## Components", input.components);
 	pushSection("## Core flows", input.coreFlows);
+	pushSection("## Data flow", input.dataFlow);
+	pushSection("## Error handling", input.errorHandling);
+	pushSection("## Testing", input.testing);
 	pushSection("## Scope for the first build", input.scope);
 	pushSection("## Success criteria", input.successCriteria);
+	pushSection("## Risks", input.risks);
+	pushSection("## Open questions", input.openQuestions);
+	pushSection("## Follow-up slices", input.followUpSlices);
 	return `${lines.join("\n")}\n`;
 }
 
@@ -1421,13 +1467,14 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 	if (!runtimeRole) {
 		pi.registerTool({
 			name: SAVE_PLAN_IDEA_TOOL_NAME,
-			label: "Save Plan Idea",
-			description: "Write a brainstormed plan idea to .pi/smalldoen/ideas/. Use this only after the user explicitly says the brainstorm is done or asks you to save the idea.",
-			promptSnippet: "Save the finalized brainstorm as a plan idea artifact.",
+			label: "Save Spec Idea",
+			description: "Write a brainstormed SPEC_IDEA to .pi/smalldoen/ideas/. Use this only after the user explicitly says the brainstorm is done or asks you to save the idea.",
+			promptSnippet: "Save the finalized brainstorm as a SPEC_IDEA artifact.",
 			promptGuidelines: [
 				"Use this only in brainstorm mode.",
-				"Use it only after the user explicitly says the brainstorm is done or explicitly asks to write or save the plan idea.",
-				"Write the idea as a collaborative build brief, not a second-person recap.",
+				"Use it only after the user explicitly says the brainstorm is done or explicitly asks to write or save the spec idea.",
+				"Write the artifact as a collaborative build brief, not a second-person recap.",
+				"Include concrete design sections when they are known: recommendation, alternatives, architecture, components, data flow, error handling, testing, scope, and success criteria.",
 			],
 			parameters: SavePlanIdeaParams,
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1443,9 +1490,19 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 					users: params.users?.map((value) => value.trim()).filter(Boolean),
 					goals: params.goals?.map((value) => value.trim()).filter(Boolean),
 					nonGoals: params.nonGoals?.map((value) => value.trim()).filter(Boolean),
+					recommendedApproach: params.recommendedApproach?.trim() || undefined,
+					alternatives: params.alternatives?.map((value) => value.trim()).filter(Boolean),
+					architecture: params.architecture?.map((value) => value.trim()).filter(Boolean),
+					components: params.components?.map((value) => value.trim()).filter(Boolean),
 					coreFlows: params.coreFlows?.map((value) => value.trim()).filter(Boolean),
+					dataFlow: params.dataFlow?.map((value) => value.trim()).filter(Boolean),
+					errorHandling: params.errorHandling?.map((value) => value.trim()).filter(Boolean),
+					testing: params.testing?.map((value) => value.trim()).filter(Boolean),
 					scope: params.scope?.map((value) => value.trim()).filter(Boolean),
 					successCriteria: params.successCriteria?.map((value) => value.trim()).filter(Boolean),
+					risks: params.risks?.map((value) => value.trim()).filter(Boolean),
+					openQuestions: params.openQuestions?.map((value) => value.trim()).filter(Boolean),
+					followUpSlices: params.followUpSlices?.map((value) => value.trim()).filter(Boolean),
 				});
 				await writeReport(target.filePath, markdown);
 				const details: PlanIdeaDetails = {
@@ -1455,12 +1512,12 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 					createdAt,
 				};
 				return {
-					content: [{ type: "text", text: [`Plan idea saved`, `Title: ${details.title}`, `Path: ${relativePath(ctx.cwd, details.path) ?? details.path}`].join("\n") }],
+					content: [{ type: "text", text: [`Spec idea saved`, `Title: ${details.title}`, `Path: ${relativePath(ctx.cwd, details.path) ?? details.path}`].join("\n") }],
 					details,
 				};
 			},
 			renderCall(args, theme) {
-				return new Text(`${theme.fg("toolTitle", theme.bold("Saving "))}${theme.fg("accent", "[PLAN_IDEA]")} ${theme.fg("toolOutput", args.title ?? "idea")}`, 0, 0);
+				return new Text(`${theme.fg("toolTitle", theme.bold("Saving "))}${theme.fg("accent", "[SPEC_IDEA]")} ${theme.fg("toolOutput", args.title ?? "idea")}`, 0, 0);
 			},
 			renderResult(result, _options, theme) {
 				const details = result.details as PlanIdeaDetails | undefined;

@@ -56,7 +56,7 @@ Rules:
 - can still inspect the repo read-only and use `docs_lookup`
 
 ### `/orch brainstorm`
-Idea-refinement mode before implementation.
+Collaborative idea-refinement mode before implementation.
 
 Rules:
 - default model: `github-copilot/gpt-5.4-mini`
@@ -64,8 +64,11 @@ Rules:
 - no `manage_run`
 - no `inspect_plan`
 - no implementation
+- asks focused questions, one at a time
+- explores 2-3 approaches with trade-offs before settling on a recommendation
+- turns the idea into a concrete design with architecture, components, data flow, error handling, testing, scope, and success criteria
 - no file writing until the user explicitly says the brainstorm is done or asks to save the idea
-- can save a plan idea to `.pi/smalldoen/ideas/<slug>.md`
+- can save a SPEC_IDEA to `.pi/smalldoen/ideas/<slug>.md`
 
 ## Indicator
 
