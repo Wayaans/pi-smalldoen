@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import { getRoleMemoryDir, getSmalldoenPaths } from "./paths";
-import { AGENT_ROLES, type AgentRole } from "./types";
+import { AGENT_ROLES, type AgentRole, type SmalldoenMode } from "./types";
 
 function normalizeUserPath(input: string): string {
 	return input.startsWith("@") ? input.slice(1) : input;
@@ -21,8 +21,16 @@ export function getRuntimeRole(): AgentRole | undefined {
 	return (AGENT_ROLES as readonly string[]).includes(value) ? (value as AgentRole) : undefined;
 }
 
-export function isTopLevelOrchestrationModeEnabled(modeEnabled: boolean): boolean {
-	return !getRuntimeRole() && modeEnabled;
+export function isTopLevelSmalldoenModeEnabled(mode: SmalldoenMode): boolean {
+	return !getRuntimeRole() && mode !== "off";
+}
+
+export function isTopLevelOrchestrationModeEnabled(mode: SmalldoenMode): boolean {
+	return !getRuntimeRole() && mode === "orchestrate";
+}
+
+export function isTopLevelAskModeEnabled(mode: SmalldoenMode): boolean {
+	return !getRuntimeRole() && mode === "ask";
 }
 
 export function assertPlannerPathAllowed(cwd: string, inputPath: string): boolean {

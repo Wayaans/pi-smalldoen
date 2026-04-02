@@ -1,61 +1,31 @@
 {
-  "ui": {
-    "modeIndicatorText": "Orchestration mode"
-  },
-  "paths": {
-    "plansDir": ".pi/smalldoen/plans",
-    "memoryDir": ".pi/smalldoen/memory",
-    "runsDir": ".pi/smalldoen/runs",
-    "scoutReportsDir": ".pi/smalldoen/reports/scout",
-    "reviewReportsDir": ".pi/smalldoen/reports/review"
-  },
   "observability": {
     "subagentLogs": "off"
   },
   "agents": {
     "orchestrator": {
-      "name": "Orchestrator",
-      "description": "Top-level orchestration controller",
       "provider": "github-copilot",
-      "model": "claude-opus-4.6",
-      "memoryDir": ".pi/smalldoen/memory/orchestrator"
+      "model": "gpt-5.4-mini"
     },
     "scout": {
-      "name": "Scout",
-      "description": "Codebase scout and documentation validator",
       "provider": "github-copilot",
-      "model": "gemini-3-pro",
-      "memoryDir": ".pi/smalldoen/memory/scout",
-      "reportDir": ".pi/smalldoen/reports/scout"
+      "model": "claude-haiku-4.5"
     },
     "planner": {
-      "name": "Planner",
-      "description": "Versioned implementation planner",
       "provider": "github-copilot",
-      "model": "claude-sonnet-4.5",
-      "memoryDir": ".pi/smalldoen/memory/planner"
+      "model": "claude-sonnet-4.5"
     },
     "engineer": {
-      "name": "Engineer",
-      "description": "Implementation worker for code and logic",
       "provider": "github-copilot",
-      "model": "claude-sonnet-4.5",
-      "memoryDir": ".pi/smalldoen/memory/engineer"
+      "model": "gpt-5.4"
     },
     "designer": {
-      "name": "Designer",
-      "description": "Implementation worker for UI, UX, and frontend presentation",
       "provider": "github-copilot",
-      "model": "claude-sonnet-4.5",
-      "memoryDir": ".pi/smalldoen/memory/designer"
+      "model": "claude-sonnet-4.5"
     },
     "reviewer": {
-      "name": "Reviewer",
-      "description": "Reviewer for changed files and affected files",
       "provider": "github-copilot",
-      "model": "claude-opus-4.6",
-      "memoryDir": ".pi/smalldoen/memory/reviewer",
-      "reportDir": ".pi/smalldoen/reports/review"
+      "model": "gpt-5.4-mini"
     }
   }
 }

@@ -1,49 +1,60 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { SMALLDOEN_MODE_ENTRY, SMALLDOEN_STATUS_KEY, type OrchestrationModeEntry, type OrchestrationModeState } from "./types";
+import {
+	SMALLDOEN_MODE_ENTRY,
+	SMALLDOEN_STATUS_KEY,
+	type OrchestrationModeEntry,
+	type OrchestrationModeState,
+	type SmalldoenMode,
+} from "./types";
 
-export function getOrchestrationMode(state: OrchestrationModeState): boolean {
-	return state.enabled;
+export function getSmalldoenMode(state: OrchestrationModeState): SmalldoenMode {
+	return state.mode;
 }
 
-export function restoreOrchestrationMode(ctx: ExtensionContext, state: OrchestrationModeState): boolean {
-	let enabled = false;
+export function getOrchestrationMode(state: OrchestrationModeState): boolean {
+	return state.mode === "orchestrate";
+}
+
+export function restoreOrchestrationMode(ctx: ExtensionContext, state: OrchestrationModeState): SmalldoenMode {
+	let mode: SmalldoenMode = "off";
 
 	for (const entry of ctx.sessionManager.getBranch() as Array<any>) {
-		if (entry.type === "custom" && entry.customType === SMALLDOEN_MODE_ENTRY) {
-			const data = entry.data as OrchestrationModeEntry | undefined;
-			if (typeof data?.enabled === "boolean") enabled = data.enabled;
-		}
+		if (entry.type !== "custom" || entry.customType !== SMALLDOEN_MODE_ENTRY) continue;
+		const data = entry.data as OrchestrationModeEntry | undefined;
+		if (data?.mode === "off" || data?.mode === "orchestrate" || data?.mode === "ask" || data?.mode === "brainstorm") mode = data.mode;
+		else if (typeof data?.enabled === "boolean") mode = data.enabled ? "orchestrate" : "off";
 	}
 
-	state.enabled = enabled;
-	applyModeIndicator(ctx, enabled);
-	return enabled;
+	state.mode = mode;
+	applyModeIndicator(ctx, mode);
+	return mode;
 }
 
 export function setOrchestrationMode(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	state: OrchestrationModeState,
-	enabled: boolean,
-): boolean {
-	state.enabled = enabled;
+	mode: SmalldoenMode,
+): SmalldoenMode {
+	state.mode = mode;
 	pi.appendEntry<OrchestrationModeEntry>(SMALLDOEN_MODE_ENTRY, {
-		enabled,
+		mode,
+		enabled: mode !== "off",
 		updatedAt: new Date().toISOString(),
 	});
-	applyModeIndicator(ctx, enabled);
-	return enabled;
+	applyModeIndicator(ctx, mode);
+	return mode;
 }
 
 export function toggleOrchestrationMode(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	state: OrchestrationModeState,
-): boolean {
-	return setOrchestrationMode(pi, ctx, state, !state.enabled);
+): SmalldoenMode {
+	return setOrchestrationMode(pi, ctx, state, state.mode === "off" ? "orchestrate" : "off");
 }
 
-export function applyModeIndicator(ctx: ExtensionContext, _enabled: boolean): void {
+export function applyModeIndicator(ctx: ExtensionContext, _mode: SmalldoenMode): void {
 	if (!ctx.hasUI) return;
 	ctx.ui.setStatus(SMALLDOEN_STATUS_KEY, undefined);
 }

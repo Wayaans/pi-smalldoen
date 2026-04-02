@@ -4,18 +4,20 @@ export const DELEGATE_TOOL_NAME = "delegate" as const;
 
 export const AGENT_ROLES = ["orchestrator", "scout", "planner", "engineer", "designer", "reviewer"] as const;
 export const SUBAGENT_LOG_MODES = ["off", "trace", "full"] as const;
+export const SMALLDOEN_MODES = ["off", "orchestrate", "ask", "brainstorm"] as const;
 
 export type SubagentLogMode = (typeof SUBAGENT_LOG_MODES)[number];
-
+export type SmalldoenMode = (typeof SMALLDOEN_MODES)[number];
 export type AgentRole = (typeof AGENT_ROLES)[number];
 
 export interface OrchestrationModeState {
-	enabled: boolean;
+	mode: SmalldoenMode;
 	previousModelSpec?: string;
 }
 
 export interface OrchestrationModeEntry {
-	enabled: boolean;
+	mode?: SmalldoenMode;
+	enabled?: boolean;
 	updatedAt: string;
 }
 
@@ -83,4 +85,11 @@ export interface ManageRunDetails {
 	completedPackageCount: number;
 	failedPackageCount: number;
 	packageId?: string;
+}
+
+export interface PlanIdeaDetails {
+	title: string;
+	slug: string;
+	path: string;
+	createdAt: string;
 }
