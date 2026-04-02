@@ -68,9 +68,12 @@ Rules:
 - no `manage_run`
 - no `inspect_plan`
 - no implementation
-- asks focused questions, one at a time
+- asks 2-5 focused questions at a time when that helps converge faster
+- it is okay to ask “ready to draft?”, and if the user confirms with yes / ok / proceed / go ahead / save it, brainstorm mode should finalize and save the current spec idea instead of asking more questions
 - explores 2-3 approaches with trade-offs before settling on a recommendation
-- turns the idea into a concrete design with architecture, components, data flow, error handling, testing, scope, and success criteria
+- turns the idea into a concrete, paste-ready mini PRD / prompt
+- the saved result starts with a direct instruction such as `Build ...` and then uses: Context, Goal, Constraints, Success criteria, Non-goals, Implementation hints
+- architecture, data flow, testing, scope, and file/module pointers are folded into those core sections when relevant
 - no file writing until the user explicitly says the brainstorm is done or asks to save the idea
 - can save a SPEC_IDEA to `.pi/smalldoen/ideas/<slug>.md`
 

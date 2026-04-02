@@ -229,16 +229,22 @@ Hard rules:
 - Until that moment, do not write files.
 - Start by understanding the current project state. Inspect relevant files, docs, and nearby context before you refine the idea.
 - Assess scope early. If the request actually contains multiple independent subsystems, say so immediately, help decompose it into smaller spec ideas, and then brainstorm the first slice.
-- Ask one focused question per message. Prefer multiple-choice questions when they make the answer easier.
+- Keep the brainstorm moving with focused clarifying questions. Ask 2-5 focused questions per message when that helps you converge faster, but avoid long exhausting questionnaires.
+- It is okay to ask whether the user is ready for a draft.
+- If the user confirms with a clear approval such as yes, ok, proceed, go ahead, looks good, or save it, treat that as approval to finalize and save the current spec idea with save_plan_idea.
+- Once the user gives that approval, stop the clarification loop and move to drafting/saving instead of asking more questions.
 - Focus on purpose, users, constraints, success criteria, non-goals, and the first realistic slice.
-- Once the idea is clear enough, propose 2-3 approaches with tradeoffs. Lead with your recommendation and explain why it fits best.
+- Once enough is known, propose 2-3 approaches with tradeoffs. Lead with your recommendation and explain why it fits best.
 - Do not jump from a rough idea to a vague summary. Make the design concrete: architecture, components, data flow, error handling, testing, scope, and success criteria.
-- Before presenting the design, ask if the user is ready for it. Then present it section by section and check whether each section looks right.
+- Turn the brainstorm into a working draft incrementally. Draft concrete sections, keep assumptions visible, and tighten the draft as answers come in.
+- The brainstorm deliverable is a paste-ready prompt / mini PRD, not a loose discussion recap.
+- In chat and in any saved SPEC_IDEA, start with a direct instruction such as "Build ..." and then use these sections in this order: Context, Goal, Constraints, Success criteria, Non-goals, Implementation hints.
+- Capture architecture, components, data flow, error handling, testing, scope, and relevant file/module pointers inside Constraints, Success criteria, and Implementation hints when they matter.
+- Show the current working draft in chat whenever it becomes useful. Do not wait until the very end to make the idea concrete.
 - Use YAGNI. Prefer smaller, well-bounded units with clear interfaces and responsibilities.
 - Keep the discussion collaborative, concrete, and explanatory. Avoid bland one-line bullets, vague claims, and second-person recap.
-- When the user explicitly asks you to write or save the spec idea, use save_plan_idea.
+- When the user explicitly asks you to write or save the spec idea, or clearly confirms a ready-to-draft prompt, use save_plan_idea.
 - The only file brainstorm mode produces is a SPEC_IDEA.
-- The resulting SPEC_IDEA should read like a collaborative build brief, for example "Let's build ...", and it should explain the recommendation, tradeoffs, and structure clearly.
 - You may use read, read-only bash commands, and docs_lookup when they help the brainstorm.
 `;
 
@@ -302,22 +308,13 @@ const DocsLookupParams = Type.Object({
 
 const SavePlanIdeaParams = Type.Object({
 	title: Type.String({ description: "Short name for the spec idea." }),
-	summary: Type.String({ description: "A short collaborative build brief in 1-3 paragraphs. Explain what we are building, why it matters, and what the first version should prove." }),
-	problem: Type.Optional(Type.String({ description: "Problem, opportunity, or motivation behind the idea." })),
-	users: Type.Optional(Type.Array(Type.String({ description: "Primary users or audiences." }))),
-	goals: Type.Optional(Type.Array(Type.String({ description: "What this idea should achieve." }))),
-	nonGoals: Type.Optional(Type.Array(Type.String({ description: "What is intentionally out of scope." }))),
-	recommendedApproach: Type.Optional(Type.String({ description: "Recommended approach and why it is the best fit." })),
-	alternatives: Type.Optional(Type.Array(Type.String({ description: "Alternative approaches and their tradeoffs." }))),
-	architecture: Type.Optional(Type.Array(Type.String({ description: "Major architectural decisions and boundaries." }))),
-	components: Type.Optional(Type.Array(Type.String({ description: "Main components or units, each with a clear purpose." }))),
-	coreFlows: Type.Optional(Type.Array(Type.String({ description: "Key user flows, capabilities, or experiences." }))),
-	dataFlow: Type.Optional(Type.Array(Type.String({ description: "How data or requests move through the system." }))),
-	errorHandling: Type.Optional(Type.Array(Type.String({ description: "Important failure cases and how the system should respond." }))),
-	testing: Type.Optional(Type.Array(Type.String({ description: "How the idea should be tested or validated." }))),
-	scope: Type.Optional(Type.Array(Type.String({ description: "Concrete scope items for the first build." }))),
-	successCriteria: Type.Optional(Type.Array(Type.String({ description: "Signals that the idea works well." }))),
-	risks: Type.Optional(Type.Array(Type.String({ description: "Main risks, dependencies, or sharp edges." }))),
+	prompt: Type.String({ description: "Paste-ready opening instruction. Start with the action, for example 'Build ...'." }),
+	context: Type.String({ description: "Short concrete context explaining why this matters and what background the implementer should know." }),
+	goal: Type.String({ description: "Explicit outcome the agent should produce, implement, or help define." }),
+	constraints: Type.Array(Type.String({ description: "Technical, product, scope, workflow, or style constraint." })),
+	successCriteria: Type.Array(Type.String({ description: "Observable or testable sign that the work is done well." })),
+	nonGoals: Type.Array(Type.String({ description: "What is intentionally out of scope for this slice." })),
+	implementationHints: Type.Array(Type.String({ description: "Preferred approach, architecture direction, boundaries, files, modules, testing notes, or other concrete guidance." })),
 	openQuestions: Type.Optional(Type.Array(Type.String({ description: "Questions that still need answers." }))),
 	followUpSlices: Type.Optional(Type.Array(Type.String({ description: "Follow-up sub-projects or later slices if the broader idea should be decomposed." }))),
 	slug: Type.Optional(Type.String({ description: "Optional custom file slug. Defaults to a slugified title." })),
@@ -815,68 +812,35 @@ async function resolvePlanIdeaPath(cwd: string, title: string, requestedSlug?: s
 
 function renderPlanIdeaMarkdown(
 	input: Omit<PlanIdeaDetails, "path"> & {
-		summary: string;
-		problem?: string;
-		users?: string[];
-		goals?: string[];
-		nonGoals?: string[];
-		recommendedApproach?: string;
-		alternatives?: string[];
-		architecture?: string[];
-		components?: string[];
-		coreFlows?: string[];
-		dataFlow?: string[];
-		errorHandling?: string[];
-		testing?: string[];
-		scope?: string[];
-		successCriteria?: string[];
-		risks?: string[];
+		prompt: string;
+		context: string;
+		goal: string;
+		constraints: string[];
+		successCriteria: string[];
+		nonGoals: string[];
+		implementationHints: string[];
 		openQuestions?: string[];
 		followUpSlices?: string[];
 	},
 ): string {
-	const quote = (value: string) => JSON.stringify(value);
-	const lines = [
-		"---",
-		`title: ${quote(input.title)}`,
-		`slug: ${quote(input.slug)}`,
-		`created_at: ${quote(input.createdAt)}`,
-		`source_mode: ${quote("brainstorm")}`,
-		`artifact_type: ${quote("SPEC_IDEA")}`,
-		"---",
-		"",
-		`# SPEC_IDEA: ${input.title}`,
-		"",
-		"## Summary",
-		"",
-		input.summary.trim(),
-	];
-	const pushParagraphSection = (heading: string, value?: string) => {
-		if (!value?.trim()) return;
-		lines.push("", heading, "", value.trim());
+	const lines = [input.prompt.trim()];
+	const pushParagraphSection = (heading: string, value: string) => {
+		lines.push("", `${heading}:`, value.trim());
 	};
-	const pushSection = (heading: string, value?: string[]) => {
-		const items = value?.map((item) => item.trim()).filter(Boolean);
-		if (!items || items.length === 0) return;
-		lines.push("", heading, ...items.map((item) => `- ${item}`));
+	const pushSection = (heading: string, value: string[]) => {
+		const items = value.map((item) => item.trim()).filter(Boolean);
+		if (items.length === 0) return;
+		lines.push("", `${heading}:`, ...items.map((item) => `- ${item}`));
 	};
-	pushParagraphSection("## Why this matters", input.problem);
-	pushSection("## Who this is for", input.users);
-	pushSection("## Goals", input.goals);
-	pushSection("## Non-goals", input.nonGoals);
-	pushParagraphSection("## Recommended approach", input.recommendedApproach);
-	pushSection("## Alternatives considered", input.alternatives);
-	pushSection("## Architecture", input.architecture);
-	pushSection("## Components", input.components);
-	pushSection("## Core flows", input.coreFlows);
-	pushSection("## Data flow", input.dataFlow);
-	pushSection("## Error handling", input.errorHandling);
-	pushSection("## Testing", input.testing);
-	pushSection("## Scope for the first build", input.scope);
-	pushSection("## Success criteria", input.successCriteria);
-	pushSection("## Risks", input.risks);
-	pushSection("## Open questions", input.openQuestions);
-	pushSection("## Follow-up slices", input.followUpSlices);
+	pushParagraphSection("Context", input.context);
+	pushParagraphSection("Goal", input.goal);
+	pushSection("Constraints", input.constraints);
+	pushSection("Success criteria", input.successCriteria);
+	pushSection("Non-goals", input.nonGoals);
+	pushSection("Implementation hints", input.implementationHints);
+	pushSection("Open questions", input.openQuestions ?? []);
+	pushSection("Follow-up slices", input.followUpSlices ?? []);
+	lines.push("", "If anything is ambiguous, make the smallest reasonable assumption, state it briefly, and continue.");
 	return `${lines.join("\n")}\n`;
 }
 
@@ -1572,44 +1536,55 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			name: SAVE_PLAN_IDEA_TOOL_NAME,
 			label: "Save Spec Idea",
 			description: "Write a brainstormed SPEC_IDEA to .pi/smalldoen/ideas/. Use this only after the user explicitly says the brainstorm is done or asks you to save the idea.",
-			promptSnippet: "Save the finalized brainstorm as a SPEC_IDEA artifact.",
+			promptSnippet: "Save the finalized brainstorm as a paste-ready SPEC_IDEA prompt.",
 			promptGuidelines: [
 				"Use this only in brainstorm mode.",
-				"Use it only after the user explicitly says the brainstorm is done or explicitly asks to write or save the spec idea.",
-				"Write the artifact as a collaborative build brief, not a second-person recap.",
-				"Include concrete design sections when they are known: recommendation, alternatives, architecture, components, data flow, error handling, testing, scope, and success criteria.",
+				"Use it after the user explicitly says the brainstorm is done, explicitly asks to write or save the spec idea, or clearly confirms a ready-to-draft prompt with approval such as yes, ok, proceed, go ahead, or save it.",
+				"Write the artifact as a paste-ready prompt / mini PRD, not as a recap.",
+				"Start with a direct instruction such as 'Build ...', then use these sections in order: Context, Goal, Constraints, Success criteria, Non-goals, Implementation hints.",
+				"Keep the first version small and concrete. Put architecture, components, data flow, testing, scope, and file/module pointers into constraints or implementation hints when helpful.",
+				"If something is still unresolved, keep it visible in Open questions instead of hiding the uncertainty.",
 			],
 			parameters: SavePlanIdeaParams,
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 				if (modeState.mode !== "brainstorm") throw new Error("save_plan_idea is available only when /orch brainstorm mode is enabled.");
+				const title = params.title.trim();
+				const prompt = params.prompt.trim();
+				const context = params.context.trim();
+				const goal = params.goal.trim();
+				const constraints = params.constraints.map((value) => value.trim()).filter(Boolean);
+				const successCriteria = params.successCriteria.map((value) => value.trim()).filter(Boolean);
+				const nonGoals = params.nonGoals.map((value) => value.trim()).filter(Boolean);
+				const implementationHints = params.implementationHints.map((value) => value.trim()).filter(Boolean);
+				const openQuestions = params.openQuestions?.map((value) => value.trim()).filter(Boolean);
+				const followUpSlices = params.followUpSlices?.map((value) => value.trim()).filter(Boolean);
+				if (!title) throw new Error("save_plan_idea requires a non-empty title.");
+				if (!prompt) throw new Error("save_plan_idea requires a non-empty prompt opening.");
+				if (!context) throw new Error("save_plan_idea requires Context.");
+				if (!goal) throw new Error("save_plan_idea requires Goal.");
+				if (constraints.length === 0) throw new Error("save_plan_idea requires at least one Constraint.");
+				if (successCriteria.length === 0) throw new Error("save_plan_idea requires at least one Success criteria item.");
+				if (nonGoals.length === 0) throw new Error("save_plan_idea requires at least one Non-goals item.");
+				if (implementationHints.length === 0) throw new Error("save_plan_idea requires at least one Implementation hints item.");
 				const createdAt = new Date().toISOString();
-				const target = await resolvePlanIdeaPath(ctx.cwd, params.title, params.slug);
+				const target = await resolvePlanIdeaPath(ctx.cwd, title, params.slug);
 				const markdown = renderPlanIdeaMarkdown({
-					title: params.title.trim(),
+					title,
 					slug: target.slug,
 					createdAt,
-					summary: params.summary.trim(),
-					problem: params.problem?.trim() || undefined,
-					users: params.users?.map((value) => value.trim()).filter(Boolean),
-					goals: params.goals?.map((value) => value.trim()).filter(Boolean),
-					nonGoals: params.nonGoals?.map((value) => value.trim()).filter(Boolean),
-					recommendedApproach: params.recommendedApproach?.trim() || undefined,
-					alternatives: params.alternatives?.map((value) => value.trim()).filter(Boolean),
-					architecture: params.architecture?.map((value) => value.trim()).filter(Boolean),
-					components: params.components?.map((value) => value.trim()).filter(Boolean),
-					coreFlows: params.coreFlows?.map((value) => value.trim()).filter(Boolean),
-					dataFlow: params.dataFlow?.map((value) => value.trim()).filter(Boolean),
-					errorHandling: params.errorHandling?.map((value) => value.trim()).filter(Boolean),
-					testing: params.testing?.map((value) => value.trim()).filter(Boolean),
-					scope: params.scope?.map((value) => value.trim()).filter(Boolean),
-					successCriteria: params.successCriteria?.map((value) => value.trim()).filter(Boolean),
-					risks: params.risks?.map((value) => value.trim()).filter(Boolean),
-					openQuestions: params.openQuestions?.map((value) => value.trim()).filter(Boolean),
-					followUpSlices: params.followUpSlices?.map((value) => value.trim()).filter(Boolean),
+					prompt,
+					context,
+					goal,
+					constraints,
+					successCriteria,
+					nonGoals,
+					implementationHints,
+					openQuestions,
+					followUpSlices,
 				});
 				await writeReport(target.filePath, markdown);
 				const details: PlanIdeaDetails = {
-					title: params.title.trim(),
+					title,
 					slug: target.slug,
 					path: target.filePath,
 					createdAt,
