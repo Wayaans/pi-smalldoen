@@ -139,7 +139,8 @@ Default artifact paths:
 - `/commits` works only in `/orch on`
 - `planner` is required before implementation in orchestration mode
 - subagent logs are optional
-- docs lookup is lightweight
+- docs lookup uses ctx7 first, retries up to 3 times, and falls back to URL fetch/search when ctx7 fails
+- `planner` and `scout` can use `docs_lookup` to validate current external API, CLI, and library behavior
 
 ## Safety
 
