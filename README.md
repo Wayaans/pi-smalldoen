@@ -20,7 +20,7 @@ pi install -l git@github.com:Wayaans/pi-smalldoen.git
 
 ## Quick start
 
-1. Enable a mode
+1. Enable a mode or start a planning flow
 2. Start working
 
 If `.pi/smalldoen.json` is missing, smalldoen copies the packaged default config into `.pi/` automatically.
@@ -28,15 +28,19 @@ If `.pi/smalldoen.json` is missing, smalldoen copies the packaged default config
 Then use one of these:
 
 ```bash
-/orch on
+/orch
 /orch ask
 /orch brainstorm
+/orch plan @spec.md
 ```
 
 ## Modes
 
-### `/orch on`
-Full orchestration mode.
+### `/orch`
+Full orchestration mode toggle and entry point.
+
+- from `off`, bare `/orch` enables orchestration mode
+- from any active mode, bare `/orch` turns smalldoen back off
 
 Top-level tools:
 - `manage_run`
@@ -70,6 +74,16 @@ Rules:
 - no file writing until the user explicitly says the brainstorm is done or asks to save the idea
 - can save a SPEC_IDEA to `.pi/smalldoen/ideas/<slug>.md`
 
+### `/orch plan @spec.md`
+Planning-only orchestration flow for large specs and PRDs.
+
+Rules:
+- validates that the attached spec file exists and is readable before loading the workflow
+- automatically switches the session into orchestration mode
+- reads the spec first, decides whether one or many plans are needed, then uses scout before planner
+- stops after planning; no engineer, designer, or reviewer delegates should run
+- returns exact ordered plan paths so implementation can follow later
+
 ## Indicator
 
 The footer keeps **ORCH** visible in all top-level modes.
@@ -82,11 +96,14 @@ Examples:
 ## Commands
 
 - `/orch`
-- `/orch on`
 - `/orch ask`
 - `/orch brainstorm`
-- `/orch off`
 - `/orch status`
+- `/orch plan @spec.md`
+- `/orch implement <description>`
+- `/orch continue [context]`
+- `/orch review`
+- `/orch summary`
 - `/smalldoen-status`
 - `/subagent-logs on|off|trace|full|status`
 - `/commits`
@@ -136,8 +153,9 @@ Default artifact paths:
 
 ## Notes
 
-- `/commits` works only in `/orch on`
+- `/commits` works only when orchestration mode is enabled with `/orch`
 - `planner` is required before implementation in orchestration mode
+- `/orch plan @spec.md` is planning-only: it should read the spec, validate with scout, and stop after planner returns one or more ordered plan artifacts
 - subagent logs are optional
 - docs lookup uses ctx7 first, retries up to 3 times, and falls back to URL fetch/search when ctx7 fails
 - `planner` and `scout` can use `docs_lookup` to validate current external API, CLI, and library behavior

@@ -25,7 +25,6 @@ import {
 	getSmalldoenMode,
 	restoreOrchestrationMode,
 	setOrchestrationMode,
-	toggleOrchestrationMode,
 } from "./mode";
 import {
 	getLatestPlanPath,
@@ -118,20 +117,45 @@ const ORCH_REVIEW_TEMPLATE = `Use orchestration mode for this request.
 If orchestration mode is not enabled, tell me to run \`/orch\` first.
 
 Load the latest orchestration run state with \`manage_run\`, inspect the latest plan, and rerun the reviewer in an isolated context with \`delegate\`. Keep the review workflow visible, then return the verdict, critical issues, warnings, rerouting guidance, and updated run status.`;
-const ORCH_USAGE = "Usage: /orch [toggle|on|ask|brainstorm|off|status|implement <description>|continue [context]|review|summary]";
+const ORCH_PLAN_USAGE = "Usage: /orch plan @spec.md";
+const ORCH_USAGE = "Usage: /orch [ask|brainstorm|status|plan @spec.md|implement <description>|continue [context]|review|summary]";
+const ORCH_LEGACY_MODE_COMMANDS = new Set(["toggle", "on", "off"]);
 const ORCH_SUBCOMMAND_COMPLETIONS: AutocompleteItem[] = [
-	{ value: "toggle", label: "toggle", description: "Toggle smalldoen mode on or off." },
-	{ value: "on", label: "on", description: "Enable orchestration mode." },
 	{ value: "ask", label: "ask", description: "Enable ask mode for direct, read-only answers without delegation." },
 	{ value: "brainstorm", label: "brainstorm", description: "Enable brainstorm mode for refining ideas into a concrete spec idea before implementation." },
-	{ value: "off", label: "off", description: "Disable smalldoen mode." },
 	{ value: "status", label: "status", description: "Show the current smalldoen mode." },
-	{ value: "implement ", label: "implement", description: "Load the implementation template. Continue typing the feature description." },
+	{ value: "plan ", label: "plan", description: "Start the planning-only workflow. Continue typing an attached spec path like @spec.md." },
+	{ value: "implement ", label: "implement", description: "Start the implementation workflow. Continue typing the feature description." },
 	{ value: "continue ", label: "continue", description: "Load the continue template. Continue typing extra context." },
-	{ value: "review", label: "review", description: "Load the review template for the latest orchestration run." },
+	{ value: "review", label: "review", description: "Start the review workflow for the latest orchestration run." },
 	{ value: "summary", label: "summary", description: "List saved orchestration run summaries." },
 ];
 const ORCH_KNOWN_COMMANDS = new Set(["", ...ORCH_SUBCOMMAND_COMPLETIONS.map((item) => item.label)]);
+
+function buildOrchPlanTemplate(specPath: string): string {
+	const suggestedFeature = path.basename(specPath, path.extname(specPath));
+	return `Use orchestration mode for this request.
+
+You are running the planning-only \`/orch plan\` workflow.
+
+Read this spec file first with \`read\`:
+- Spec path: \`${specPath}\`
+- Suggested feature seed: \`${suggestedFeature || "spec"}\`
+
+Hard rules:
+- do not implement code
+- do not delegate engineer, designer, or reviewer
+- if the spec is missing detail, unreadable, or too vague to plan, stop and explain why
+
+Workflow:
+- start a planning run with \`manage_run\`
+- read the spec and decide whether one implementation plan is enough or whether the scope should be split into multiple ordered plans
+- delegate scout to validate assumptions and gather repository or documentation context needed for planning
+- if one plan is enough, delegate planner once and return the exact plan path
+- if the scope is broad, split it into the smallest implementation-ready slices and delegate planner once per slice in implementation order so each slice gets its own versioned plan artifact
+- keep the workflow visible by explaining the scope judgment before each major delegation
+- finish after planning only with the exact ordered plan path list and a short explanation of the chosen order`;
+}
 const COMMITS_SYSTEM_PROMPT = `You write concise, high-signal git commit messages.
 
 Rules:
@@ -167,6 +191,8 @@ Hard rules:
 - Before each major delegation, briefly tell the user what you decided and why.
 - After each delegated role finishes, read its result yourself and decide the next step.
 - Planner is mandatory before any implementation work.
+- Planning-only requests are valid. When the user asks only for plans, stop after scout and planner work.
+- Do not delegate engineer, designer, or reviewer for planning-only requests such as \`/orch plan\`.
 - Only launch multiple engineer or designer delegates in the same turn when you intentionally chose a parallel-safe group from inspect_plan.
 - After each package finishes, update the run package state with manage_run.
 - Run reviewer only after the relevant packages are complete.
@@ -313,6 +339,58 @@ function resolveOptionalUserPath(cwd: string, input?: string): string | undefine
 	if (!input) return undefined;
 	const normalized = input.startsWith("@") ? input.slice(1) : input;
 	return path.resolve(cwd, normalized);
+}
+
+function unwrapQuotedValue(value: string): string {
+	const trimmed = value.trim();
+	if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+		return trimmed.slice(1, -1).trim();
+	}
+	return trimmed;
+}
+
+function parsePlanSpecPath(value: string): string | undefined {
+	const normalized = value.trim();
+	if (!normalized) return undefined;
+	const withoutAt = normalized.startsWith("@") ? normalized.slice(1).trim() : normalized;
+	const unwrapped = unwrapQuotedValue(withoutAt);
+	return unwrapped || undefined;
+}
+
+async function ensureReadableSpecFile(specPath: string): Promise<void> {
+	let stats;
+	try {
+		stats = await fs.stat(specPath);
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		throw new Error(`Could not read spec file: ${specPath} (${detail})`);
+	}
+	if (!stats.isFile()) throw new Error(`Spec path is not a file: ${specPath}`);
+	try {
+		const content = await fs.readFile(specPath, "utf8");
+		if (!content.trim()) throw new Error("Spec file is empty.");
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		throw new Error(`Could not read spec file: ${specPath} (${detail})`);
+	}
+}
+
+async function switchTopLevelMode(pi: ExtensionAPI, ctx: any, current: SmalldoenMode, next: SmalldoenMode): Promise<void> {
+	if (current === next) {
+		syncTopLevelTools(pi);
+		await refreshRunVisualization(ctx);
+		return;
+	}
+	setOrchestrationMode(pi, ctx, modeState, next);
+	if (!runtimeRole) {
+		if (next === "orchestrate") await ensureOrchestrationRuntime(ctx.cwd);
+		else if (next !== "off") await ensureConfigPresent(ctx.cwd);
+		if (next !== "off") await applyTopLevelModeModel(pi, ctx, modeState);
+		else await restorePreviousModel(pi, ctx, modeState);
+	}
+	if (next !== "orchestrate") setActiveRun(undefined);
+	syncTopLevelTools(pi);
+	await refreshRunVisualization(ctx);
 }
 
 function syncTopLevelTools(pi: ExtensionAPI): void {
@@ -1053,6 +1131,22 @@ function setCommandInput(pi: ExtensionAPI, ctx: any, text: string): void {
 	else ctx.ui.setEditorText(text);
 }
 
+async function startOrchWorkflowPrompt(
+	pi: ExtensionAPI,
+	ctx: any,
+	current: SmalldoenMode,
+	prompt: string,
+	notification: string,
+): Promise<void> {
+	if (current !== "orchestrate") await switchTopLevelMode(pi, ctx, current, "orchestrate");
+	if (!ctx.isIdle()) {
+		ctx.abort();
+		await ctx.waitForIdle();
+	}
+	pi.sendUserMessage(prompt);
+	ctx.ui.notify(notification, "info");
+}
+
 function getOrchArgumentCompletions(argumentPrefix: string): AutocompleteItem[] | null {
 	const normalizedPrefix = argumentPrefix.replace(/^\s+/, "");
 	if (/\s/.test(normalizedPrefix)) return null;
@@ -1153,7 +1247,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("orch", {
-		description: "Control smalldoen modes (toggle|on|ask|brainstorm|off|status|implement|continue|review|summary)",
+		description: "Control smalldoen modes and planning workflows (/orch, /orch ask, /orch brainstorm, /orch plan)",
 		getArgumentCompletions: getOrchArgumentCompletions,
 		handler: async (args, ctx) => {
 			const rawArgs = (args || "").trim();
@@ -1161,6 +1255,10 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 			const command = (spaceIndex === -1 ? rawArgs : rawArgs.slice(0, spaceIndex)).toLowerCase();
 			const commandArgs = spaceIndex === -1 ? "" : rawArgs.slice(spaceIndex + 1).trim();
 			const current = getSmalldoenMode(modeState);
+			if (ORCH_LEGACY_MODE_COMMANDS.has(command)) {
+				ctx.ui.notify("`/orch on`, `/orch off`, and `/orch toggle` are no longer supported. Use bare `/orch` for orchestration mode control.", "warning");
+				return;
+			}
 			if (!ORCH_KNOWN_COMMANDS.has(command)) {
 				ctx.ui.notify(ORCH_USAGE, "warning");
 				return;
@@ -1171,10 +1269,27 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 				await refreshRunVisualization(ctx);
 				return;
 			}
+			if (command === "plan") {
+				const parsedSpecPath = parsePlanSpecPath(commandArgs);
+				if (!parsedSpecPath) {
+					ctx.ui.notify(ORCH_PLAN_USAGE, "warning");
+					return;
+				}
+				const resolvedSpecPath = path.resolve(ctx.cwd, parsedSpecPath);
+				try {
+					await ensureReadableSpecFile(resolvedSpecPath);
+				} catch (error) {
+					ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+					return;
+				}
+				const displaySpecPath = relativePath(ctx.cwd, resolvedSpecPath) ?? resolvedSpecPath;
+				const workflowPrompt = buildOrchPlanTemplate(displaySpecPath);
+				await startOrchWorkflowPrompt(pi, ctx, current, workflowPrompt, `Started /orch plan for ${displaySpecPath}`);
+				return;
+			}
 			if (command === "implement") {
 				const featureLine = commandArgs ? `\n\nFeature request: ${commandArgs}` : "";
-				setCommandInput(pi, ctx, `${ORCH_IMPLEMENT_TEMPLATE}${featureLine}`);
-				ctx.ui.notify("Loaded /orch implement template into the input.", "info");
+				await startOrchWorkflowPrompt(pi, ctx, current, `${ORCH_IMPLEMENT_TEMPLATE}${featureLine}`, "Started /orch implement workflow.");
 				return;
 			}
 			if (command === "continue") {
@@ -1184,8 +1299,7 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 				return;
 			}
 			if (command === "review") {
-				setCommandInput(pi, ctx, ORCH_REVIEW_TEMPLATE);
-				ctx.ui.notify("Loaded /orch review template into the input.", "info");
+				await startOrchWorkflowPrompt(pi, ctx, current, ORCH_REVIEW_TEMPLATE, "Started /orch review workflow.");
 				return;
 			}
 			if (command === "summary") {
@@ -1208,24 +1322,13 @@ export default function smalldoenExtension(pi: ExtensionAPI) {
 				ctx.ui.notify(`Listed ${files.length} saved summary file(s).`, "info");
 				return;
 			}
-			if ((command === "" || command === "toggle" || command === "on" || command === "ask" || command === "brainstorm" || command === "off") && !ctx.isIdle()) ctx.abort();
+			if ((command === "" || command === "ask" || command === "brainstorm") && !ctx.isIdle()) ctx.abort();
 			let next: SmalldoenMode = current;
-			if (command === "on") next = "orchestrate";
-			else if (command === "ask") next = "ask";
+			if (command === "ask") next = "ask";
 			else if (command === "brainstorm") next = "brainstorm";
-			else if (command === "off") next = "off";
-			else next = toggleOrchestrationMode(pi, ctx, modeState);
-			if (command === "on" || command === "ask" || command === "brainstorm" || command === "off") setOrchestrationMode(pi, ctx, modeState, next);
-			if (!runtimeRole) {
-				if (next === "orchestrate") await ensureOrchestrationRuntime(ctx.cwd);
-				else if (next !== "off") await ensureConfigPresent(ctx.cwd);
-				if (next !== "off") await applyTopLevelModeModel(pi, ctx, modeState);
-				else await restorePreviousModel(pi, ctx, modeState);
-			}
-			syncTopLevelTools(pi);
+			else next = current === "off" ? "orchestrate" : "off";
+			await switchTopLevelMode(pi, ctx, current, next);
 			ctx.ui.notify(describeMode(next), "info");
-			if (current !== next && next !== "orchestrate") setActiveRun(undefined);
-			await refreshRunVisualization(ctx);
 		},
 	});
 
